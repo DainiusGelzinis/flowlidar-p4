@@ -5,3 +5,11 @@ build/
 __pycache__/
 *.pyc
 .cache/
+
+# Claude Code memory
+.claude/
+
+# Log files
+logs/
+*.log
+zlog-cfg-cur
