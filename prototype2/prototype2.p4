@@ -5,8 +5,8 @@
  * the data plane. Detect new flows and notify the control plane via a digest.
  *
  * What this prototype adds over prototype1:
- *   - 4 independent BF register arrays (4 x 128K bits = 64 KB total)
- *   - 4 CRC hash functions with different polynomials
+ *   - 3 independent BF register arrays (3 x 128K bits = 48 KB total)
+ *   - 3 CRC hash functions with different polynomials
  *   - Atomic check-and-set RegisterActions
  *   - Digest to notify the control plane on new flow detection
  *
@@ -18,8 +18,9 @@
  *          - Send FlowID to the control plane via digest
  *     3. Send x to the packet counting block (CMS — added in prototype3)
  *
- * BF parameters (from paper, Section 5):
- *   k = 4 arrays, m = 128K bits per array
+ * BF parameters:
+ *   k = 3 arrays, m = 128K bits per array
+ *   (reduced from paper's k=4 to free 2 MAU stages for the CMS in prototype3)
  *
  * Future prototypes:
  *   - Prototype 3: Count-Min Sketch (packet counting)
@@ -63,7 +64,6 @@ struct metadata_t {
     bit<17> idx0;
     bit<17> idx1;
     bit<17> idx2;
-    bit<17> idx3;
 }
 
 // ---------------------------------------------------------------------------
@@ -167,18 +167,19 @@ control SwitchIngress(
         inout ingress_intrinsic_metadata_for_tm_t ig_tm_md) {
 
     // -------------------------------------------------------------------------
-    // Bloom Filter — 4 independent arrays of 128K bits (k=4, m=128K)
+    // Bloom Filter — 3 independent arrays of 128K bits (k=3, m=128K)
     //
     // Each array is indexed by a different CRC hash of the 5-tuple.
     // RegisterAction atomically reads the old value and sets the bit to 1.
     // Returned value: 0 = bit was unset (flow not seen on this array)
     //                 1 = bit was already set (flow seen on this array)
+    //
+    // k=3 (reduced from paper's k=4) frees 2 MAU stages for the CMS.
     // -------------------------------------------------------------------------
 
     Register<bit<1>, bit<17>>(131072) bf_0;
     Register<bit<1>, bit<17>>(131072) bf_1;
     Register<bit<1>, bit<17>>(131072) bf_2;
-    Register<bit<1>, bit<17>>(131072) bf_3;
 
     RegisterAction<bit<1>, bit<17>, bit<1>>(bf_0) bf_check_set_0 = {
         void apply(inout bit<1> val, out bit<1> rv) {
@@ -201,15 +202,8 @@ control SwitchIngress(
         }
     };
 
-    RegisterAction<bit<1>, bit<17>, bit<1>>(bf_3) bf_check_set_3 = {
-        void apply(inout bit<1> val, out bit<1> rv) {
-            rv  = val;
-            val = 1;
-        }
-    };
-
     // -------------------------------------------------------------------------
-    // Hash functions — 4 different CRC32 polynomials for independence
+    // Hash functions — 3 different CRC32 polynomials for independence
     // Each produces a 17-bit index into its BF array (2^17 = 131072 entries).
     // -------------------------------------------------------------------------
 
@@ -243,20 +237,20 @@ control SwitchIngress(
                            ) poly2;
     Hash<bit<17>>(HashAlgorithm_t.CUSTOM, poly2) hash2;
 
-    // CRC32D
-    CRCPolynomial<bit<32>>(32w0xA833982B,
-                           true,
-                           false,
-                           false,
-                           32w0xFFFFFFFF,
-                           32w0xFFFFFFFF
-                           ) poly3;
-    Hash<bit<17>>(HashAlgorithm_t.CUSTOM, poly3) hash3;
-
     // -------------------------------------------------------------------------
     // Hash computation tables — one per stage to stay within the 32-bit
     // immediate-pathway limit.  Each action writes one 17-bit index into
     // metadata; the @stage annotation guarantees a separate MAU stage.
+    //
+    // Stage allocation (k=3 BF, 4-row CMS in prototype3):
+    //   Stage 0 : tbl_hash0  (LPM table shares this stage via TCAM)
+    //   Stage 1 : tbl_hash1
+    //   Stage 2 : tbl_hash2
+    //   Stage 3 : bf_check_set_0.execute()
+    //   Stage 4 : bf_check_set_1.execute()
+    //   Stage 5 : bf_check_set_2.execute()
+    //   Stage 6-9 : cms_inc_0..3.execute()  (added in prototype3)
+    //   Stage 10-11: free
     // -------------------------------------------------------------------------
 
     action compute_idx0() {
@@ -274,34 +268,23 @@ control SwitchIngress(
                                  hdr.ipv4.protocol,
                                  ig_md.src_port, ig_md.dst_port});
     }
-    action compute_idx3() {
-        ig_md.idx3 = hash3.get({hdr.ipv4.src_addr, hdr.ipv4.dst_addr,
-                                 hdr.ipv4.protocol,
-                                 ig_md.src_port, ig_md.dst_port});
-    }
 
-    @stage(1)
+    @stage(0)
     table tbl_hash0 {
         actions     = { compute_idx0; }
         default_action = compute_idx0;
         size        = 1;
     }
-    @stage(2)
+    @stage(1)
     table tbl_hash1 {
         actions     = { compute_idx1; }
         default_action = compute_idx1;
         size        = 1;
     }
-    @stage(3)
+    @stage(2)
     table tbl_hash2 {
         actions     = { compute_idx2; }
         default_action = compute_idx2;
-        size        = 1;
-    }
-    @stage(4)
-    table tbl_hash3 {
-        actions     = { compute_idx3; }
-        default_action = compute_idx3;
         size        = 1;
     }
 
@@ -348,28 +331,25 @@ control SwitchIngress(
             // Step 2: Forward packet.
             ipv4_lpm.apply();
 
-            // Step 3: Compute 4 hash indices, each in its own stage.
+            // Step 3: Compute 3 hash indices, each in its own stage.
             tbl_hash0.apply();
             tbl_hash1.apply();
             tbl_hash2.apply();
-            tbl_hash3.apply();
 
             // Step 4: Atomically check and set each BF array.
-            // Execute all 4 unconditionally — RegisterActions cannot be
+            // Execute all 3 unconditionally — RegisterActions cannot be
             // called conditionally in TNA.
             bit<1> b0 = bf_check_set_0.execute(ig_md.idx0);
             bit<1> b1 = bf_check_set_1.execute(ig_md.idx1);
             bit<1> b2 = bf_check_set_2.execute(ig_md.idx2);
-            bit<1> b3 = bf_check_set_3.execute(ig_md.idx3);
 
-            // Step 5: If ALL 4 bits were already set → known flow (no action).
+            // Step 5: If ALL 3 bits were already set → known flow (no action).
             //         If ANY bit was 0 → new flow → trigger digest.
             // Tofino requires each condition to compare one runtime value to a
-            // constant, so we use 4 separate checks instead of ANDing them.
+            // constant, so we use 3 separate checks instead of ANDing them.
             if (b0 == 0) { ig_dprsr_md.digest_type = 1; }
             if (b1 == 0) { ig_dprsr_md.digest_type = 1; }
             if (b2 == 0) { ig_dprsr_md.digest_type = 1; }
-            if (b3 == 0) { ig_dprsr_md.digest_type = 1; }
         } else {
             miss();
         }

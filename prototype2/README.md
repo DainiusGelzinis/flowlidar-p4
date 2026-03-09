@@ -16,15 +16,15 @@ hardware — zero control-plane overhead per packet.
 
 | Component | Description |
 |-----------|-------------|
-| **4 BF register arrays** | `Register<bit<1>, bit<17>>(131072)` — one bit per cell, 128K cells per array |
-| **4 CRC hash functions** | Different CRC32 polynomials (CRC32, CRC32/BZIP2, CRC32C, CRC32D) produce independent 17-bit indices |
+| **3 BF register arrays** | `Register<bit<1>, bit<17>>(131072)` — one bit per cell, 128K cells per array |
+| **3 CRC hash functions** | Different CRC32 polynomials (CRC32, CRC32/BZIP2, CRC32C) produce independent 17-bit indices |
 | **RegisterActions** | Atomic check-and-set: reads old bit value, then unconditionally sets it to 1 |
 | **flow_digest_t struct** | Carries the 5-tuple (src IP, dst IP, protocol, src port, dst port) to the control plane |
 | **Digest** | `Digest<flow_digest_t>()` in the deparser triggers a gRPC notification to the control plane |
-| **metadata_t extended** | Added `src_port`, `dst_port`, and four 17-bit hash indices `idx0`–`idx3` |
-| **Hash stage tables** | Four keyless tables (`tbl_hash0`–`tbl_hash3`), each `@stage` annotated, to stay within Tofino's 32-bit immediate-pathway limit per stage |
+| **metadata_t extended** | Added `src_port`, `dst_port`, and three 17-bit hash indices `idx0`–`idx2` |
+| **Hash stage tables** | Three keyless tables (`tbl_hash0`–`tbl_hash2`), each `@stage` annotated, to stay within Tofino's 32-bit immediate-pathway limit per stage |
 | **control_plane.py** | Standalone Python script receiving and printing flow digests over gRPC |
-| **reset_epoch.py** | Clears all 4 BF arrays to start a new measurement epoch (run via bfshell) |
+| **reset_epoch.py** | Clears all 3 BF arrays to start a new measurement epoch (run via bfshell) |
 
 ---
 
@@ -36,8 +36,8 @@ For every IPv4 packet arriving at the switch:
 
 ```
 1. Extract 5-tuple (src_ip, dst_ip, proto, src_port, dst_port)
-2. Compute 4 independent hash indices h0..h3 over the 5-tuple
-3. Atomically check-and-set bf_0[h0], bf_1[h1], bf_2[h2], bf_3[h3]
+2. Compute 3 independent hash indices h0..h2 over the 5-tuple
+3. Atomically check-and-set bf_0[h0], bf_1[h1], bf_2[h2]
    - Each RegisterAction returns the OLD value (0 = absent, 1 = present)
    - Unconditionally writes 1 (marks as present)
 4. If ANY returned value was 0 → new flow → trigger digest to control plane
@@ -51,35 +51,66 @@ The control plane receives the 5-tuple and records it.
 
 ## Bloom Filter Parameters
 
-| Parameter | Value | Source |
-|-----------|-------|--------|
-| k (hash functions) | 4 | Paper Section 5 |
+| Parameter | Value | Note |
+|-----------|-------|------|
+| k (hash functions) | 3 | Reduced from paper's k=4 to free 2 MAU stages for CMS (Prototype 3) |
 | m (bits per array) | 131,072 (2^17) | Paper Section 5 |
-| Total BF memory | 4 × 128 KB = 64 KB | — |
+| Total BF memory | 3 × 128 Kbits = 48 KB | — |
 | Hash index width | 17 bits | log2(131072) |
+
+### Why k=3 instead of k=4
+
+The paper specifies k=4, but Tofino 1 has only 12 ingress MAU stages. Each
+`RegisterAction.execute()` consumes one stage exclusively (stateful ALU
+constraint). With k=4 BF arrays + 4 CMS rows, all 12 stages are consumed with
+zero slack, leaving no room for future additions (e.g. Lazy BF in Prototype 4).
+
+Reducing to k=3 frees 2 stages (1 hash + 1 register execute), giving the
+following budget for Prototype 3 onwards:
+
+```
+Stage  0 : tbl_hash0  (LPM table shares via TCAM)
+Stage  1 : tbl_hash1
+Stage  2 : tbl_hash2
+Stage  3 : bf_check_set_0.execute()
+Stage  4 : bf_check_set_1.execute()
+Stage  5 : bf_check_set_2.execute()
+Stage  6 : cms_inc_0.execute()   ← Prototype 3
+Stage  7 : cms_inc_1.execute()   ← Prototype 3
+Stage  8 : cms_inc_2.execute()   ← Prototype 3
+Stage  9 : cms_inc_3.execute()   ← Prototype 3
+Stage 10 : free
+Stage 11 : free
+```
 
 ### False Positives
 
-A false positive occurs when a **new** flow has all 4 of its hash positions
+A false positive occurs when a **new** flow has all 3 of its hash positions
 already set to 1 by previously-seen flows.  The BF then treats it as known and
 **suppresses** the digest — the control plane misses that flow for this epoch.
 
-False negatives are **impossible**: once a flow's 4 bits are set, every
+False negatives are **impossible**: once a flow's 3 bits are set, every
 subsequent packet from that flow is correctly suppressed.
 
 Approximate false positive rate with n flows inserted:
 
 ```
-p ≈ (1 - e^(-4n / 131072))^4
+p ≈ (1 - e^(-3n / 131072))^3
 ```
 
-| Flows (n) | FP rate |
-|-----------|---------|
-| 1,000 | ~0.008% |
-| 10,000 | ~0.5% |
-| 50,000 | ~38% |
+| Flows (n) | k=3 (this impl) | k=4 (paper) | Better |
+|-----------|-----------------|-------------|--------|
+| 1,000     | ~0.001%         | ~0.00008%   | k=4    |
+| 10,000    | ~0.86%          | ~0.48%      | k=4    |
+| 27,000    | ~8%             | ~8%         | equal (crossover) |
+| 50,000    | ~32%            | ~38%        | k=3    |
 
-The epoch reset keeps n low and FP rate manageable.
+At low-to-moderate loads k=4 wins because four independent checks give stronger
+discrimination.  Above ~27K flows per epoch k=3 wins because it sets fewer bits
+per flow and therefore fills the filter more slowly — the optimal k at that load
+is `(m/n)·ln2 = (131072/50000)·0.693 ≈ 1.82`, so k=3 is closer to optimal
+than k=4.  In practice, the epoch reset is the primary mechanism for keeping
+n — and therefore the FP rate — low.
 
 ---
 
@@ -100,26 +131,25 @@ greater than the available bits 32
 ```
 
 **Fix:** each hash is computed in its own keyless table action annotated with
-`@stage(1)` through `@stage(4)`.  The result is stored in metadata
-(`ig_md.idx0`–`ig_md.idx3`) and consumed by the RegisterActions in later
+`@stage(0)` through `@stage(2)`.  The result is stored in metadata
+(`ig_md.idx0`–`ig_md.idx2`) and consumed by the RegisterActions in later
 stages.
 
 ### Condition Constraint: One Operand Must Be Constant
 
-ANDing four runtime 1-bit values in a single condition:
+ANDing multiple runtime 1-bit values in a single condition:
 
 ```p4
-if ((b0 & b1 & b2 & b3) == 0) { ... }  // compiler error
+if ((b0 & b1 & b2) == 0) { ... }  // compiler error
 ```
 
-was rejected as "condition too complex".  **Fix:** four separate comparisons,
+was rejected as "condition too complex".  **Fix:** three separate comparisons,
 each comparing one runtime value to the constant `0`:
 
 ```p4
 if (b0 == 0) { ig_dprsr_md.digest_type = 1; }
 if (b1 == 0) { ig_dprsr_md.digest_type = 1; }
 if (b2 == 0) { ig_dprsr_md.digest_type = 1; }
-if (b3 == 0) { ig_dprsr_md.digest_type = 1; }
 ```
 
 ### Digest Mechanism
@@ -138,7 +168,7 @@ prototype2/
 ├── prototype2.p4       # P4-16 data plane program (Tofino/TNA)
 ├── build.sh            # Build script (cmake + make)
 ├── setup_table.py      # Adds LPM forwarding entry (run via bfshell)
-├── reset_epoch.py      # Clears all 4 BF arrays (run via bfshell)
+├── reset_epoch.py      # Clears all 3 BF arrays (run via bfshell)
 ├── control_plane.py    # Standalone Python: receives flow digest notifications
 └── test_packet.py      # Scapy test: sends packets, verifies BF behaviour
 ```

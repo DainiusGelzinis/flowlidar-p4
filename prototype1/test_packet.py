@@ -1,5 +1,5 @@
 import time
-from scapy.all import Ether, IP, TCP, sendp, AsyncSniffer
+from scapy.all import Ether, IP, TCP, sendp, AsyncSniffer # type: ignore
 
 # Start sniffing on BOTH veth2 and veth3 to see where packet arrives
 sniffer2 = AsyncSniffer(iface="veth2", filter="ip", count=1, timeout=3)
