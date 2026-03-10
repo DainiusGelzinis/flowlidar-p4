@@ -181,7 +181,7 @@ sudo -E $SDE/run_tofino_model.sh -p prototype3
 
 Wait for:
 ```
-CLI listening on port 8000
+Blocking on message from CPU
 ```
 
 ---
