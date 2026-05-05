@@ -187,50 +187,90 @@ def read_cms_snapshot(bfrt_info, target):
     return snapshot, field_names
 
 
-def read_bf_snapshot(bfrt_info, target):
-    """Bulk-read all 3 BF arrays into memory (3 gRPC calls total, not 3 per flow)."""
+def _read_register_cells(bfrt_info, tbl_name, indices, target):
+    """Read specific register cells in one gRPC call. Returns {idx: value}."""
+    if not indices:
+        return {}
+    tbl = bfrt_info.table_get(tbl_name)
+    reg_short      = tbl_name.split('.')[-1]
+    expected_field = f'SwitchIngress.{reg_short}.f1'
+    keys   = [tbl.make_key([gc.KeyTuple('$REGISTER_INDEX', i)]) for i in indices]
+    result = {}
+    try:
+        for k, data in tbl.entry_get(target, keys, {'from_hw': True}):
+            k_dict = k.to_dict()
+            d_dict = data.to_dict()
+            if '$REGISTER_INDEX' in d_dict:
+                idx_src, val_src = d_dict, k_dict
+            else:
+                idx_src, val_src = k_dict, d_dict
+            idx_raw = idx_src.get('$REGISTER_INDEX', 0)
+            idx = idx_raw.get('value', 0) if isinstance(idx_raw, dict) else int(idx_raw)
+            if expected_field in val_src:
+                val = val_src[expected_field]
+            elif expected_field in idx_src:
+                val = idx_src[expected_field]
+            else:
+                combined = {**k_dict, **d_dict}
+                f1 = next((f for f in combined if f.endswith('.f1')), None)
+                val = combined[f1] if f1 else 0
+            if isinstance(val, list):
+                val = val[0]
+            result[idx] = int(val)
+    except Exception as e:
+        print(f"  [WARN] targeted read failed for {tbl_name}: {e}")
+    return result
+
+
+def read_bf_snapshot(bfrt_info, target, flow_table):
+    """Read only the BF cells needed by flows in flow_table (one gRPC call per row)."""
+    indices_needed = [set() for _ in BF_ROWS]
+    for flow_key in flow_table:
+        idxs = bf_indices(flow_key)
+        if idxs:
+            for r, idx in enumerate(idxs):
+                indices_needed[r].add(idx)
     snapshot = {}
-    for row in BF_ROWS:
+    for r, row in enumerate(BF_ROWS):
         tbl_name = f'pipe.SwitchIngress.{row}'
-        snapshot[row] = _read_register_array(bfrt_info, tbl_name, BF_SIZE, target)
+        snapshot[row] = _read_register_cells(
+            bfrt_info, tbl_name, list(indices_needed[r]), target)
     return snapshot
 
 
 def read_bf_bits_for_flow(bf_snapshot, flow_key):
-    """Return (b0, b1, b2) from an already-fetched in-memory BF snapshot."""
+    """Return (b0, b1, b2) from an in-memory BF snapshot (dict per row)."""
     idxs = bf_indices(flow_key)
     if idxs is None:
         return None
     i0, i1, i2 = idxs
-    return (bf_snapshot['bf_0'][i0], bf_snapshot['bf_1'][i1], bf_snapshot['bf_2'][i2])
+    return (bf_snapshot['bf_0'].get(i0, 0),
+            bf_snapshot['bf_1'].get(i1, 0),
+            bf_snapshot['bf_2'].get(i2, 0))
 
 
-def clear_all_registers(bfrt_info, target, cms_field_names=None):
-    reg_sizes = {r: BF_SIZE  for r in BF_ROWS}
-    reg_sizes.update({r: CMS_SIZE for r in CMS_ROWS})
+def _clear_indices(tbl, field_name, indices, target, batch=4096):
+    """Write 0 to a specific set of register indices."""
+    for start in range(0, len(indices), batch):
+        chunk = indices[start:start + batch]
+        keys  = [tbl.make_key([gc.KeyTuple('$REGISTER_INDEX', i)]) for i in chunk]
+        datas = [tbl.make_data([gc.DataTuple(field_name, 0)]) for _ in chunk]
+        try:
+            tbl.entry_mod(target, keys, datas)
+        except Exception as e:
+            print(f"  [WARN] clear failed: {e}")
 
-    for reg in BF_ROWS + CMS_ROWS:
-        tbl_name   = f'pipe.SwitchIngress.{reg}'
-        size       = reg_sizes[reg]
-        field_name = (cms_field_names or {}).get(reg, f'SwitchIngress.{reg}.f1')
 
-        tbl  = bfrt_info.table_get(tbl_name)
-        BATCH = 128
-        ok    = True
-        for start in range(0, size, BATCH):
-            end   = min(start + BATCH, size)
-            keys  = [tbl.make_key([gc.KeyTuple('$REGISTER_INDEX', i)])
-                     for i in range(start, end)]
-            datas = [tbl.make_data([gc.DataTuple(field_name, 0)])
-                     for _ in range(start, end)]
-            try:
-                tbl.entry_mod(target, keys, datas)
-            except Exception as e:
-                print(f"  [WARN] Could not clear {reg}[{start}:{end}]: {e}")
-                ok = False
-                break
-        if not ok:
-            print(f"  [INFO] Partial clear for {reg}.")
+def clear_registers_targeted(bfrt_info, target, bf_snapshot, cms_snapshot):
+    """Clear only the register cells that were actually set this epoch."""
+    for row in BF_ROWS:
+        tbl = bfrt_info.table_get(f'pipe.SwitchIngress.{row}')
+        nz  = [i for i, v in bf_snapshot[row].items() if v != 0]
+        _clear_indices(tbl, f'SwitchIngress.{row}.f1', nz, target)
+    for row in CMS_ROWS:
+        tbl = bfrt_info.table_get(f'pipe.SwitchIngress.{row}')
+        nz  = [i for i, v in enumerate(cms_snapshot[row]) if v != 0]
+        _clear_indices(tbl, f'SwitchIngress.{row}.f1', nz, target)
 
 
 # ---------------------------------------------------------------------------
@@ -414,13 +454,12 @@ def process_epoch(epoch_num, flow_table, bfrt_info, target):
 
     if not flow_table:
         print('  (no flows this epoch)')
-        clear_all_registers(bfrt_info, target)
         print(f'{sep}\n')
         return
 
     print('  Reading BF + CMS registers...')
-    bf_snapshot                   = read_bf_snapshot(bfrt_info, target)
-    cms_snapshot, cms_field_names = read_cms_snapshot(bfrt_info, target)
+    bf_snapshot              = read_bf_snapshot(bfrt_info, target, flow_table)
+    cms_snapshot, _          = read_cms_snapshot(bfrt_info, target)
 
     if not HAS_CRCMOD:
         print()
@@ -453,7 +492,7 @@ def process_epoch(epoch_num, flow_table, bfrt_info, target):
 
     print()
     print('  Clearing BF + CMS registers for next epoch...')
-    clear_all_registers(bfrt_info, target, cms_field_names)
+    clear_registers_targeted(bfrt_info, target, bf_snapshot, cms_snapshot)
     print(f'{sep}\n')
 
 
