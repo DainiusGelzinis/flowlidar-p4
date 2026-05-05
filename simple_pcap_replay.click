@@ -1,6 +1,6 @@
 
 //define the trace
-define($trace <path to PCAP file>)
+define($trace /opt/p4eval/data/equinix_2019/equinix-nyc.dirA.20190117-130000.UTC.anon.pcap)
 
 
 // define the transmission port
@@ -12,7 +12,7 @@ define($txverbose 99)
 define($rxverbose 99)
 
 //set sending rate to 10Gbps
-define($RATE 10Gbps) //1Gpbs
+define($RATE 1Mbps)
 
 define($max_packets_in_queue 500000)
 define($replay_count -1)
@@ -21,7 +21,7 @@ define($replay_count -1)
 //d :: DPDKInfo(NB_SOCKET_MBUF  2048575) //Should be a bit more than 4 times the limit
 
 /* Can be whatever */
-define($INsrcmac b8:3f:d2:9f:2e:9b)
+define($INsrcmac b8:3f:d2:b0:d7:78)
 /* Hotpot: b8:3f:d2:b0:d7:79, Grill: b8:3f:d2:9f:2e:9b Onie: 70:b3:d5:cc:ff:3c */
 define($INdstmac b8:3f:d2:b0:d7:79)
 
@@ -31,7 +31,7 @@ define($quick false)
 
 
 // read the trace
-fdIN :: FromDump($trace, STOP true, BURST 1, TIMING false, TIMING_FNT "100", ACTIVE true)
+fdIN :: FromDump($trace, STOP false, BURST 1, TIMING false, TIMING_FNT "100", ACTIVE true)
 
 
 // set port for transmission
@@ -93,8 +93,6 @@ ig :: Script(TYPE ACTIVE,
     set count $(pkt_cnt.add count),
     print "SENT PKTS: $count",
     print "SEND RATE: $(gen0/cnt.bit_rate)",
-    print "RCVD PKTS: $(oc0.count)",
-    print "RX bit rate: $(oc0.bit_rate)",
     print "#######################",
     goto loop
 )
