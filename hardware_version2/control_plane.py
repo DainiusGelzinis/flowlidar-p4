@@ -456,8 +456,13 @@ def process_epoch(epoch_num, flow_table, bfrt_info, target, total=0):
         n_solver = len(solver_results)
         n_total  = len(flow_table)
 
+        epoch_digests   = sum(flow_table.values())
+        epoch_packets   = sum(resolved.values()) + sum(solver_results.values())
+
         print(f'  Total flows          : {n_total}')
-        print(f'  Total digests        : {total}')
+        print(f'  Epoch digests        : {epoch_digests}  (cumulative: {total})')
+        print(f'  Estimated packets    : {epoch_packets}  '
+              f'(digests: {epoch_digests} + CMS: {epoch_packets - epoch_digests})')
         print(f'  Digest only (Alg4)   : {n_alg4}  ({100*n_alg4/n_total:.1f}%)')
         print(f'  Digest only (Alg5)   : {n_alg5}  ({100*n_alg5/n_total:.1f}%)')
         print(f'  Equation solver      : {n_solver}  ({100*n_solver/n_total:.1f}%)')
