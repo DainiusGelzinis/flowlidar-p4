@@ -12,7 +12,7 @@ define($txverbose 99)
 define($rxverbose 99)
 
 //set sending rate to 10Gbps
-define($RATE 1Mbps)
+define($RATE 1Gbps)
 
 define($max_packets_in_queue 500000)
 define($replay_count -1)
