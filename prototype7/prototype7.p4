@@ -1,21 +1,20 @@
 /* =============================================================================
  * prototype7.p4 — FlowLiDAR Prototype 7
  *
- * Same architecture as prototype6, but with the Bloom Filter doubled:
- *   3 × 262144 × 1 bit  (was 3 × 131072 × 1 bit in prototype6)
+ * BF grown 8× vs prototype6 (4× vs original prototype7):
+ *   3 × 1048576 × 1 bit  (was 3 × 131072 in prototype6, 3 × 262144 in earlier
+ *   prototype7). Each BF row now uses ~8 SRAM blocks per stage on Tofino 1
+ *   — about 10% of the per-stage SRAM budget, still well within limits.
  *
- * Goal: reduce BF saturation at 1 Gbps + 15 s epochs from ~76% hidden flows
- * by halving the per-cell load. Memory cost: ~96 KB total across stages 3–5
- * (2 SRAM blocks per array, was 1 block) — still trivial vs the per-stage
- * budget on Tofino 1.
+ * Index width is now 20 bits per BF row (was 18).
  *
  * CMS sub-sketches unchanged from prototype6 (64 × 1024 cells per row).
  *
  * Stage allocation (12 ingress MAU stages on Tofino 1):
  *
- *   Stage 0  : tbl_hash0      — BF idx0 (18-bit, CRC32)
- *   Stage 1  : tbl_hash1      — BF idx1 (18-bit, CRC32/BZIP2)
- *   Stage 2  : tbl_hash2      — BF idx2 (18-bit, CRC32C)
+ *   Stage 0  : tbl_hash0      — BF idx0 (20-bit, CRC32)
+ *   Stage 1  : tbl_hash1      — BF idx1 (20-bit, CRC-32D)
+ *   Stage 2  : tbl_hash2      — BF idx2 (20-bit, CRC-32C)
  *   Stage 3  : tbl_bf0        — always: check-and-set bf_0       [unchanged]
  *   Stage 4  : tbl_bf1        — conditional on b0==1             [unchanged]
  *   Stage 5  : tbl_bf2        — conditional on b0==1 AND b1==1   [unchanged]
@@ -58,10 +57,10 @@ struct metadata_t {
     bit<16> src_port;
     bit<16> dst_port;
 
-    // BF hash indices — 18-bit each.
-    bit<18> idx0;
-    bit<18> idx1;
-    bit<18> idx2;
+    // BF hash indices — 20-bit each (1M cells per row).
+    bit<20> idx0;
+    bit<20> idx1;
+    bit<20> idx2;
 
     // BF check-and-set results — needed across stages for conditional logic.
     bit<1> b0;
@@ -182,23 +181,23 @@ control SwitchIngress(
     // BLOOM FILTER — Lazy Updates (Algorithm 2)        [identical to prototype5]
     // =========================================================================
 
-    Register<bit<1>, bit<18>>(262144) bf_0;
-    Register<bit<1>, bit<18>>(262144) bf_1;
-    Register<bit<1>, bit<18>>(262144) bf_2;
+    Register<bit<1>, bit<20>>(1048576) bf_0;
+    Register<bit<1>, bit<20>>(1048576) bf_1;
+    Register<bit<1>, bit<20>>(1048576) bf_2;
 
-    RegisterAction<bit<1>, bit<18>, bit<1>>(bf_0) bf_check_set_0 = {
+    RegisterAction<bit<1>, bit<20>, bit<1>>(bf_0) bf_check_set_0 = {
         void apply(inout bit<1> val, out bit<1> rv) {
             rv  = val;
             val = 1;
         }
     };
-    RegisterAction<bit<1>, bit<18>, bit<1>>(bf_1) bf_check_set_1 = {
+    RegisterAction<bit<1>, bit<20>, bit<1>>(bf_1) bf_check_set_1 = {
         void apply(inout bit<1> val, out bit<1> rv) {
             rv  = val;
             val = 1;
         }
     };
-    RegisterAction<bit<1>, bit<18>, bit<1>>(bf_2) bf_check_set_2 = {
+    RegisterAction<bit<1>, bit<20>, bit<1>>(bf_2) bf_check_set_2 = {
         void apply(inout bit<1> val, out bit<1> rv) {
             rv  = val;
             val = 1;
@@ -208,7 +207,7 @@ control SwitchIngress(
     CRCPolynomial<bit<32>>(32w0x04C11DB7,
                            true, false, false,
                            32w0xFFFFFFFF, 32w0xFFFFFFFF) poly0;
-    Hash<bit<18>>(HashAlgorithm_t.CUSTOM, poly0) hash0;
+    Hash<bit<20>>(HashAlgorithm_t.CUSTOM, poly0) hash0;
 
     // poly1: CRC-32D (0xA833982B) — distinct generator from poly0 (0x04C11DB7)
     // and poly2 (0x1EDC6F41 / CRC-32C). Earlier prototypes shared poly0's
@@ -217,12 +216,12 @@ control SwitchIngress(
     CRCPolynomial<bit<32>>(32w0xA833982B,
                            true, false, false,
                            32w0xFFFFFFFF, 32w0xFFFFFFFF) poly1;
-    Hash<bit<18>>(HashAlgorithm_t.CUSTOM, poly1) hash1;
+    Hash<bit<20>>(HashAlgorithm_t.CUSTOM, poly1) hash1;
 
     CRCPolynomial<bit<32>>(32w0x1EDC6F41,
                            true, false, false,
                            32w0xFFFFFFFF, 32w0xFFFFFFFF) poly2;
-    Hash<bit<18>>(HashAlgorithm_t.CUSTOM, poly2) hash2;
+    Hash<bit<20>>(HashAlgorithm_t.CUSTOM, poly2) hash2;
 
     action compute_idx0() {
         ig_md.idx0 = hash0.get({hdr.ipv4.src_addr, hdr.ipv4.dst_addr,

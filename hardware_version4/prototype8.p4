@@ -1,29 +1,35 @@
 /* =============================================================================
- * prototype7.p4 — FlowLiDAR Prototype 7
+ * prototype8.p4 — FlowLiDAR Prototype 8 (Traditional BF baseline)
  *
- * BF grown 8× vs prototype6 (4× vs original prototype7):
- *   3 × 1048576 × 1 bit  (was 3 × 131072 in prototype6, 3 × 262144 in earlier
- *   prototype7). Each BF row now uses ~8 SRAM blocks per stage on Tofino 1
- *   — about 10% of the per-stage SRAM budget, still well within limits.
+ * Drops the lazy-update BF logic in favour of a TRADITIONAL Bloom Filter:
+ *   - All 3 BF rows are checked-and-set unconditionally on every packet.
+ *   - A digest is sent if ANY of the 3 bits was 0 before this packet.
+ *   - Each visible flow therefore generates exactly ONE digest.
  *
- * Index width is now 20 bits per BF row (was 18).
+ * Bloom Filter sized to match prototype5 / prototype6:
+ *   3 × 131072 × 1 bit (17-bit indexing)
  *
- * CMS sub-sketches unchanged from prototype6 (64 × 1024 cells per row).
+ * The point of this prototype is to get a clean baseline:
+ *   - No conditional table chain, no lazy semantics.
+ *   - Algorithms 4 / 5 (digest-count classification) collapse — every visible
+ *     flow becomes a "solver candidate" because we cannot distinguish 1-pkt
+ *     from N-pkt flows from BF state alone.
+ *   - CMS sub-sketches unchanged from prototype6/7 (64 × 1024 × 16 bit).
  *
  * Stage allocation (12 ingress MAU stages on Tofino 1):
  *
- *   Stage 0  : tbl_hash0      — BF idx0 (20-bit, CRC32)
- *   Stage 1  : tbl_hash1      — BF idx1 (20-bit, CRC-32D)
- *   Stage 2  : tbl_hash2      — BF idx2 (20-bit, CRC-32C)
- *   Stage 3  : tbl_bf0        — always: check-and-set bf_0       [unchanged]
- *   Stage 4  : tbl_bf1        — conditional on b0==1             [unchanged]
- *   Stage 5  : tbl_bf2        — conditional on b0==1 AND b1==1   [unchanged]
+ *   Stage 0  : tbl_hash0       — BF idx0 (17-bit, CRC-32)
+ *   Stage 1  : tbl_hash1       — BF idx1 (17-bit, CRC-32D)
+ *   Stage 2  : tbl_hash2       — BF idx2 (17-bit, CRC-32C)
+ *   Stage 3  : tbl_bf0         — always: check-and-set bf_0
+ *   Stage 4  : tbl_bf1         — always: check-and-set bf_1
+ *   Stage 5  : tbl_bf2         — always: check-and-set bf_2
  *   Stage 6  : tbl_master_hash — master hash (6-bit, sub-sketch id)
- *   Stage 7  : tbl_cms_hash   — col hashes + bit-concat to 16-bit indices
- *   Stage 8  : tbl_cms_0      — conditional CMS row 0 increment
- *   Stage 9  : tbl_cms_1      — conditional CMS row 1 increment
- *   Stage 10 : tbl_cms_2      — conditional CMS row 2 increment
- *   Stage 11 : free
+ *   Stage 7  : tbl_col_hash_*  — column hashes (3 × 10-bit)
+ *   Stage 8  : tbl_cms_idx_*   — CMS indices (3 × 16-bit add)
+ *   Stage 9  : tbl_cms_0       — conditional CMS row 0 increment
+ *   Stage 10 : tbl_cms_1       — conditional CMS row 1 increment
+ *   Stage 11 : tbl_cms_2       — conditional CMS row 2 increment
  * ============================================================================= */
 
 #include <core.p4>
@@ -57,12 +63,12 @@ struct metadata_t {
     bit<16> src_port;
     bit<16> dst_port;
 
-    // BF hash indices — 20-bit each (1M cells per row).
-    bit<20> idx0;
-    bit<20> idx1;
-    bit<20> idx2;
+    // BF hash indices — 17-bit each (131072 cells per row, prototype5 size).
+    bit<17> idx0;
+    bit<17> idx1;
+    bit<17> idx2;
 
-    // BF check-and-set results — needed across stages for conditional logic.
+    // BF check-and-set results. With traditional BF all 3 are always populated.
     bit<1> b0;
     bit<1> b1;
     bit<1> b2;
@@ -178,26 +184,26 @@ control SwitchIngress(
         inout ingress_intrinsic_metadata_for_tm_t ig_tm_md) {
 
     // =========================================================================
-    // BLOOM FILTER — Lazy Updates (Algorithm 2)        [identical to prototype5]
+    // BLOOM FILTER — Traditional check-and-set (no lazy updates)
     // =========================================================================
 
-    Register<bit<1>, bit<20>>(1048576) bf_0;
-    Register<bit<1>, bit<20>>(1048576) bf_1;
-    Register<bit<1>, bit<20>>(1048576) bf_2;
+    Register<bit<1>, bit<17>>(131072) bf_0;
+    Register<bit<1>, bit<17>>(131072) bf_1;
+    Register<bit<1>, bit<17>>(131072) bf_2;
 
-    RegisterAction<bit<1>, bit<20>, bit<1>>(bf_0) bf_check_set_0 = {
+    RegisterAction<bit<1>, bit<17>, bit<1>>(bf_0) bf_check_set_0 = {
         void apply(inout bit<1> val, out bit<1> rv) {
             rv  = val;
             val = 1;
         }
     };
-    RegisterAction<bit<1>, bit<20>, bit<1>>(bf_1) bf_check_set_1 = {
+    RegisterAction<bit<1>, bit<17>, bit<1>>(bf_1) bf_check_set_1 = {
         void apply(inout bit<1> val, out bit<1> rv) {
             rv  = val;
             val = 1;
         }
     };
-    RegisterAction<bit<1>, bit<20>, bit<1>>(bf_2) bf_check_set_2 = {
+    RegisterAction<bit<1>, bit<17>, bit<1>>(bf_2) bf_check_set_2 = {
         void apply(inout bit<1> val, out bit<1> rv) {
             rv  = val;
             val = 1;
@@ -207,21 +213,20 @@ control SwitchIngress(
     CRCPolynomial<bit<32>>(32w0x04C11DB7,
                            true, false, false,
                            32w0xFFFFFFFF, 32w0xFFFFFFFF) poly0;
-    Hash<bit<20>>(HashAlgorithm_t.CUSTOM, poly0) hash0;
+    Hash<bit<17>>(HashAlgorithm_t.CUSTOM, poly0) hash0;
 
-    // poly1: CRC-32D (0xA833982B) — distinct generator from poly0 (0x04C11DB7)
-    // and poly2 (0x1EDC6F41 / CRC-32C). Earlier prototypes shared poly0's
-    // generator with only differing bit reversal, which left the two hashes
-    // correlated and inflated BF FP rate beyond theory.
+    // Three distinct CRC-32 generator polynomials (poly0/1/2 do NOT share
+    // the same generator — only differing bit reversal would leave them
+    // correlated).
     CRCPolynomial<bit<32>>(32w0xA833982B,
                            true, false, false,
                            32w0xFFFFFFFF, 32w0xFFFFFFFF) poly1;
-    Hash<bit<20>>(HashAlgorithm_t.CUSTOM, poly1) hash1;
+    Hash<bit<17>>(HashAlgorithm_t.CUSTOM, poly1) hash1;
 
     CRCPolynomial<bit<32>>(32w0x1EDC6F41,
                            true, false, false,
                            32w0xFFFFFFFF, 32w0xFFFFFFFF) poly2;
-    Hash<bit<20>>(HashAlgorithm_t.CUSTOM, poly2) hash2;
+    Hash<bit<17>>(HashAlgorithm_t.CUSTOM, poly2) hash2;
 
     action compute_idx0() {
         ig_md.idx0 = hash0.get({hdr.ipv4.src_addr, hdr.ipv4.dst_addr,
@@ -256,7 +261,7 @@ control SwitchIngress(
     }
 
     // =========================================================================
-    // LAZY BF TABLES                                    [identical to prototype5]
+    // TRADITIONAL BF TABLES — every packet runs check-and-set on all 3 rows
     // =========================================================================
 
     action run_bf0() {
@@ -271,27 +276,19 @@ control SwitchIngress(
     action run_bf1() {
         ig_md.b1 = bf_check_set_1.execute(ig_md.idx1);
     }
-    action skip_bf1() {
-        ig_md.b1 = 0;
-    }
     @stage(4) table tbl_bf1 {
-        key            = { ig_md.b0 : exact; }
-        actions        = { run_bf1; skip_bf1; }
-        default_action = skip_bf1;
-        size           = 2;
+        actions        = { run_bf1; }
+        default_action = run_bf1;
+        size           = 1;
     }
 
     action run_bf2() {
         ig_md.b2 = bf_check_set_2.execute(ig_md.idx2);
     }
-    action skip_bf2() {
-        ig_md.b2 = 0;
-    }
     @stage(5) table tbl_bf2 {
-        key            = { ig_md.b0 : exact; ig_md.b1 : exact; }
-        actions        = { run_bf2; skip_bf2; }
-        default_action = skip_bf2;
-        size           = 4;
+        actions        = { run_bf2; }
+        default_action = run_bf2;
+        size           = 1;
     }
 
     // =========================================================================

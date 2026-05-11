@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-FlowLiDAR hardware_version3 — Control Plane (Sub-sketch / Sketchlet partitioning)
+FlowLiDAR hardware_version4 — Control Plane (Traditional BF + sub-sketch solver)
 Run this on p4switch2 (the real Tofino 1 switch).
 
-Adds master-hash sub-sketch partitioning to the equation solver:
-  - Each flow is mapped to one of 64 buckets by a master hash.
-  - The CMS is logically 64 sub-sketches × 1024 cells per row.
-  - Solver runs 64 small independent systems instead of one large one.
-
-Otherwise identical to hardware_version: BF preprocessing (Alg 4), CMS
-preprocessing (Alg 5), exact equation solving, Algorithm 6 fallback.
+Differences from hardware_version3:
+  - Traditional BF in P4: every visible flow generates exactly ONE digest.
+  - Algorithms 4 / 5 (digest-count classification) are bypassed — every
+    visible flow becomes a "solver candidate" with packet count = 1 (digest)
+    + min(CMS rows).
+  - BF size back to 131072 cells per row (prototype5/6 size, bit<17>).
+  - Sub-sketch partitioning (master hash, 64 × 1024 columns) is unchanged.
 
 Usage:
     python3 control_plane.py [--epoch SECONDS]
@@ -50,7 +50,7 @@ except ImportError:
 GRPC_ADDR  = 'localhost:50052'
 CLIENT_ID  = 0
 DEVICE_ID  = 0
-P4_NAME    = 'prototype7'
+P4_NAME    = 'prototype8'
 
 # Sub-sketch parameters (must match P4)
 NUM_BUCKETS    = 64                  # Master hash output: 6 bits
@@ -58,10 +58,10 @@ COLS_PER_ROW   = 1024                # Columns per sub-sketch (10 bits)
 CMS_SIZE       = NUM_BUCKETS * COLS_PER_ROW   # 65536 total cells per row
 CMS_ROWS       = ['cms_0', 'cms_1', 'cms_2']
 BF_ROWS        = ['bf_0',  'bf_1',  'bf_2']
-BF_SIZE        = 1048576  # 2^20  (8x hardware_version2)
+BF_SIZE        = 131072   # 2^17  (prototype5/6 size, traditional BF)
 
 # ---------------------------------------------------------------------------
-# CRC functions (polynomials must match prototype7.p4 exactly)
+# CRC functions (polynomials must match prototype8.p4 exactly)
 # ---------------------------------------------------------------------------
 if HAS_CRCMOD:
     # Master hash — 0xF4ACFB13, rev=true, init=residue=0xFFFFFFFF
@@ -446,26 +446,23 @@ def process_epoch(epoch_num, flow_table, bfrt_info, target, total=0):
     else:
         print()
 
-        resolved, C        = algorithm4_bf_preprocess(flow_table, bf_snapshot)
-        resolved5, C_final = algorithm5_cms_preprocess(C, flow_table, cms_snapshot)
-        resolved.update(resolved5)
+        # Traditional BF: skip Algorithms 4/5 — every visible flow gets exactly
+        # one digest, so digest-count classification is uninformative. All flows
+        # go straight to the sub-sketch equation solver.
+        C_final        = list(flow_table.keys())
         solver_results = solve_cms_system(C_final, flow_table, cms_snapshot)
         print()
 
-        n_alg4   = len(resolved) - len(resolved5)
-        n_alg5   = len(resolved5)
         n_solver = len(solver_results)
         n_total  = len(flow_table)
 
-        epoch_digests   = sum(flow_table.values())
-        epoch_packets   = sum(resolved.values()) + sum(solver_results.values())
+        epoch_digests = sum(flow_table.values())
+        epoch_packets = sum(solver_results.values())
 
         print(f'  Total flows          : {n_total}')
         print(f'  Epoch digests        : {epoch_digests}  (cumulative: {total})')
         print(f'  Estimated packets    : {epoch_packets}  '
               f'(digests: {epoch_digests} + CMS: {epoch_packets - epoch_digests})')
-        print(f'  Digest only (Alg4)   : {n_alg4}  ({100*n_alg4/n_total:.1f}%)')
-        print(f'  Digest only (Alg5)   : {n_alg5}  ({100*n_alg5/n_total:.1f}%)')
         print(f'  Equation solver      : {n_solver}  ({100*n_solver/n_total:.1f}%)')
 
     print()
@@ -480,14 +477,14 @@ def process_epoch(epoch_num, flow_table, bfrt_info, target, total=0):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='FlowLiDAR hardware_version3 — Control Plane (Sub-sketch solver)')
+        description='FlowLiDAR hardware_version4 — Control Plane (Traditional BF + sub-sketch solver)')
     parser.add_argument('--epoch', type=float, default=10.0,
                         help='Epoch length in seconds (default: 10)')
     args = parser.parse_args()
     epoch_seconds = args.epoch
 
     print('=' * 72)
-    print('  FlowLiDAR hardware_version3 — Control Plane (Sub-sketch solver)')
+    print('  FlowLiDAR hardware_version4 — Control Plane (Traditional BF + sub-sketch solver)')
     print(f'  Connecting to {GRPC_ADDR} ...')
     print(f'  Epoch length : {epoch_seconds}s')
     print(f'  Sub-sketches : {NUM_BUCKETS} × {COLS_PER_ROW} cells/row')

@@ -56,7 +56,7 @@ COLS_PER_ROW   = 1024                # Columns per sub-sketch (10 bits)
 CMS_SIZE       = NUM_BUCKETS * COLS_PER_ROW   # 65536 total cells per row
 CMS_ROWS       = ['cms_0', 'cms_1', 'cms_2']
 BF_ROWS        = ['bf_0',  'bf_1',  'bf_2']
-BF_SIZE        = 262144   # 2^18  (doubled from prototype6)
+BF_SIZE        = 1048576  # 2^20  (8x prototype6, 4x earlier prototype7)
 
 # ---------------------------------------------------------------------------
 # CRC functions
