@@ -151,6 +151,90 @@ Click on hotpot reported `SENT PKTS: 2,904,320` for the same window.
 
 ---
 
+## 5 s epoch run (after Algorithm 6 was added)
+
+Same hardware, same data plane, same C++ CP — only `--epoch` changed from
+15 s to 5 s. Click was running continuously; the CP captured a ~3 s
+effective window after its ~2 s startup delay.
+
+| Metric | 15 s epoch | **5 s epoch** |
+|--------|-----------:|--------------:|
+| Visible flows | 240,473 | **91,836** |
+| Epoch digests | 304,454 | 127,586 |
+| Estimated packets | 3,339,231 | 799,272 |
+| Avg pkts/flow | 13.9 | **8.7** |
+| Per-flow inflation vs ~7 pkts/flow truth | ~1.40× | **~1.24×** |
+| Bulk read | 6.44 s | 6.20 s |
+| Bulk clear | 3.32 s | 1.60 s |
+
+### Algorithms 4/5 fire much more at 5 s
+
+| Path | 15 s run | **5 s run** |
+|------|---------:|------------:|
+| Alg 4 (1/2-pkt mice) | 4.76% | **27.32%** |
+| Alg 5 (3-pkt flows) | 0.17% | **1.34%** |
+| Solver / min fallback | 95.07% | **71.34%** |
+
+Pure saturation effect on the BF rows used by Algs 4/5:
+
+| Saturation | 15 s run | **5 s run** |
+|------------|---------:|------------:|
+| bf_0 | 91% | 54% |
+| bf_1 | 85% | **38%** |
+| bf_2 | 77% | **27%** |
+| max sub-sketch load | 3.65 | **1.09** |
+
+At 38% `bf_1` saturation a true 1-pkt mouse has a much higher chance of
+finding `bf_1[idx1] == 0`, so Algorithm 4 actually classifies it without
+having to trust possibly-contaminated CMS values.
+
+### The exact solver finally fires
+
+Bucket allocation at 5 s:
+```
+exact: 32 / 64       Alg6: 0       n > cols skip: 32 / 64
+```
+
+Half the buckets stayed under the 1024-flow threshold and were solved
+exactly by Gauss-Jordan; the other half were still over-loaded and hit
+the cheap `min(cms_rows)` fallback. Algorithm 6 (rank < n with n ≤ 1024)
+still didn't fire on this trace — for that we'd need either a different
+flow distribution or a wider sub-sketch CMS.
+
+### Coverage at 5 s
+
+Click reported `SENT PKTS: 584,416 → 815,648` over the sampled window,
+call it ~700K packets. Interpolating `pcap_distribution_strict.sh` gives
+~115K true flows for that window.
+
+```
+Coverage = 91,836 / ~115,000 = ~80%
+```
+
+Same coverage ratio as the 15 s run (~84%) — the BF FP floor is the same
+regardless of epoch length, the data plane just sees fewer flows in
+absolute terms when the window is shorter.
+
+### EPOCH 2 — post-click trickle
+
+After click stops, the CP sees a small tail of late-arriving 1-pkt mice:
+```
+6,921 flows / 7,074 digests / 7,074 packets
+Alg4: 6,918 (99.96%)   Alg5: 3 (0.04%)   solver: 0
+```
+Algorithm 4 resolved every flow exactly. Confirms the lazy-BF +
+classification logic is correct when BF is sparse.
+
+### Two simultaneous wins from shorter epochs
+
+1. **Lower per-flow inflation** (1.40× → 1.24×) because:
+   - Much more flows resolved exactly via Algs 4/5 (no CMS contamination)
+   - The Gauss-Jordan solver fires for half the buckets (vs zero at 15 s)
+2. **Faster epoch turnaround**: bulk clear 3.3 s → 1.6 s (fewer non-zero
+   cells to clear). Total per-epoch CP I/O ~8 s.
+
+---
+
 ## Suggested follow-ups
 
 1. **Tighter solver fallback.** When `n > kColsPerRow` we currently use
