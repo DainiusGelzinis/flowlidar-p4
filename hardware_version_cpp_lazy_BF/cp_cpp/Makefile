@@ -53,12 +53,12 @@ endif
 LIBS         := $(GRPC_LIBS) -lgrpc++_reflection -lprotobuf -lpthread
 
 TARGET       := lazy_bf_cp
-SRCS         := main.cpp bfrt_client.cpp $(GEN_SRCS)
+SRCS         := main.cpp bfrt_client.cpp solver.cpp $(GEN_SRCS)
 
 all: $(TARGET)
 
-$(TARGET): $(SRCS) bfrt_client.hpp crc.hpp flow.hpp
-	$(CXX) $(CXXFLAGS) -o $@ main.cpp bfrt_client.cpp $(GEN_SRCS) \
+$(TARGET): $(SRCS) bfrt_client.hpp crc.hpp flow.hpp solver.hpp
+	$(CXX) $(CXXFLAGS) -o $@ main.cpp bfrt_client.cpp solver.cpp $(GEN_SRCS) \
 	    $(LDFLAGS) $(LIBS)
 
 # Generate C++ bfruntime stubs. We pass both the proto's own dir and the

@@ -12,9 +12,12 @@
 //       * Prints a one-line summary (flows, digests, est. packets, max load).
 //       * Bulk-clears all 6 register tables.
 //
-// MVP only — no equation solver yet (just min-of-rows). Algorithms 4/5/6
-// can be added in a follow-up. Pure C++ in a single process, so we own the
-// only bfrt-grpc client_id 0 session and don't fight the Python CP for it.
+// Pure C++ in a single process, so we own the only bfrt-grpc client_id 0
+// session. Per-flow estimate runs the sub-sketch equation solver (see
+// solver.hpp); buckets that turn out under-determined fall back to
+// min(cms_rows) for safety. Algorithms 4/5 (digest-count classification)
+// not implemented — the lazy-BF expected-digest-count optimisation is a
+// future enhancement.
 
 #include <atomic>
 #include <chrono>
@@ -31,6 +34,10 @@
 #include "bfrt_client.hpp"
 #include "crc.hpp"
 #include "flow.hpp"
+#include "solver.hpp"
+
+#include <array>
+#include <unordered_map>
 
 static constexpr const char* kAddr      = "localhost:50052";
 static constexpr const char* kP4Name    = "lazy_bf";
@@ -270,37 +277,80 @@ int main(int argc, char** argv) {
         }
         std::cerr << std::dec;
 
-        // Per-flow estimate: digests + min(CMS rows). This is the lazy-BF
-        // formula — for visible flows with <=3 packets CMS_min should be 0;
-        // for elephant flows it tracks the post-3rd-packet count.
-        uint64_t epoch_digests = 0, epoch_packets = 0;
-        uint64_t bucket_load[64] = {0};
+        // Per-flow estimate via the sub-sketch equation solver.
+        // 1) Group flows by master-hash bucket; for each flow precompute its
+        //    3 (row, cell) tuples.
+        // 2) Solve each bucket's A·x = b for per-flow CMS contribution.
+        // 3) Buckets that come back under-determined fall back to
+        //    digest_count + min(cms_rows).
+        struct PerFlow {
+            const FlowKey* key;
+            uint32_t       dcount;
+            std::array<std::pair<int, uint32_t>, 3> cells;
+        };
+        std::array<std::vector<FlowKey>, 64>                    buckets;
+        std::array<std::vector<std::array<std::pair<int,uint32_t>,3>>, 64> bucket_cells;
+        std::vector<PerFlow> flows_meta; flows_meta.reserve(snap.size());
+        std::array<std::vector<uint64_t>, 3> cms_arr{cms[0], cms[1], cms[2]};
+
+        uint64_t epoch_digests = 0;
         for (const auto& kv : snap) {
             const FlowKey& k = kv.first;
-            uint32_t dcount  = kv.second;
-            epoch_digests += dcount;
-
+            uint32_t       dc = kv.second;
+            epoch_digests += dc;
             auto bytes = pack_5tuple(k.src_ip, k.dst_ip, k.proto,
                                       k.src_port, k.dst_port);
             uint32_t bucket = master_bucket(bytes);
             uint32_t off    = bucket << 10;
-            uint32_t i0 = off | cms_col(polys::cms0, bytes);
-            uint32_t i1 = off | cms_col(polys::cms1, bytes);
-            uint32_t i2 = off | cms_col(polys::cms2, bytes);
-            uint64_t cms_min = std::min({cms[0][i0], cms[1][i1], cms[2][i2]});
-            epoch_packets += dcount + cms_min;
-            bucket_load[bucket] += 1;
+            std::array<std::pair<int,uint32_t>,3> cells = {{
+                {0, off | cms_col(polys::cms0, bytes)},
+                {1, off | cms_col(polys::cms1, bytes)},
+                {2, off | cms_col(polys::cms2, bytes)},
+            }};
+            buckets[bucket].push_back(k);
+            bucket_cells[bucket].push_back(cells);
+            flows_meta.push_back({&kv.first, dc, cells});
         }
-        uint64_t max_bucket = 0;
-        for (auto v : bucket_load) if (v > max_bucket) max_bucket = v;
-        double   max_load   = (double)max_bucket / kColsPerRow;
+
+        uint64_t epoch_packets    = epoch_digests;
+        size_t   exact_buckets    = 0, fallback_buckets = 0;
+        size_t   total_used_buckets = 0;
+        uint64_t max_bucket_flows = 0;
+        std::unordered_map<const FlowKey*, uint64_t> per_flow_cms;
+        for (size_t b = 0; b < 64; ++b) {
+            if (buckets[b].empty()) continue;
+            ++total_used_buckets;
+            if (buckets[b].size() > max_bucket_flows) max_bucket_flows = buckets[b].size();
+            SolverResult r = solve_bucket(buckets[b], bucket_cells[b], cms_arr);
+            if (r.exact) ++exact_buckets;
+            else         ++fallback_buckets;
+            for (size_t j = 0; j < buckets[b].size(); ++j) {
+                uint64_t v;
+                if (r.exact) {
+                    v = r.cms_estimate[j];
+                } else {
+                    auto& cells = bucket_cells[b][j];
+                    v = std::min({cms[0][cells[0].second],
+                                  cms[1][cells[1].second],
+                                  cms[2][cells[2].second]});
+                }
+                // Map back to the flow_table key.
+                auto it = snap.find(buckets[b][j]);
+                if (it != snap.end()) per_flow_cms[&(it->first)] = v;
+                epoch_packets += v;
+            }
+        }
+        double max_load = (double)max_bucket_flows / kColsPerRow;
 
         std::cerr << "  Total flows            : " << snap.size() << "\n"
                   << "  Epoch digests          : " << epoch_digests << "\n"
                   << "  Estimated packets      : " << epoch_packets
-                  << "  (digests + CMS)\n"
+                  << "  (digests + solver-derived CMS)\n"
+                  << "  Sub-sketch buckets used: " << total_used_buckets
+                  << " / 64  (exact: " << exact_buckets
+                  << ", fallback min(): " << fallback_buckets << ")\n"
                   << "  Max sub-sketch load    : " << max_load
-                  << "  (max bucket = " << max_bucket << " / "
+                  << "  (max bucket = " << max_bucket_flows << " flows / "
                   << kColsPerRow << " cols)\n";
 
         std::cerr << "  Clearing BF + CMS registers (targeted, non-zero only)...\n";
