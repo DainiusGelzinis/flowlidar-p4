@@ -1,0 +1,333 @@
+// main.cpp — pure C++ control plane for hardware_version_cpp_lazy_BF.
+//
+// What it does:
+//   - Connects to bfrt-grpc on localhost:50052
+//   - Subscribes + binds to the P4 program "lazy_bf"
+//   - Reads digests off the StreamChannel into a flow_table (lazy BF: each
+//     visible flow generates 1, 2, or 3 digests).
+//   - Every --epoch seconds:
+//       * Bulk-reads the 3 BF + 3 CMS register tables.
+//       * For each visible flow computes per-flow packet count =
+//             digest_count + min(cms_0[idx0], cms_1[idx1], cms_2[idx2]).
+//       * Prints a one-line summary (flows, digests, est. packets, max load).
+//       * Bulk-clears all 6 register tables.
+//
+// MVP only — no equation solver yet (just min-of-rows). Algorithms 4/5/6
+// can be added in a follow-up. Pure C++ in a single process, so we own the
+// only bfrt-grpc client_id 0 session and don't fight the Python CP for it.
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "bfrt_client.hpp"
+#include "crc.hpp"
+#include "flow.hpp"
+
+static constexpr const char* kAddr      = "localhost:50052";
+static constexpr const char* kP4Name    = "lazy_bf";
+static constexpr uint32_t    kDeviceId  = 0;
+static constexpr uint32_t    kClientId  = 0;
+
+static constexpr uint32_t    kBfSize    = 131072;   // 2^17 cells per BF row
+static constexpr uint32_t    kCmsSize   = 65536;    // 64 buckets * 1024 cols
+static constexpr uint32_t    kColsPerRow = 1024;
+
+static const std::vector<std::string> kBfNames = {
+    "pipe.SwitchIngress.bf_0",
+    "pipe.SwitchIngress.bf_1",
+    "pipe.SwitchIngress.bf_2"
+};
+static const std::vector<std::string> kCmsNames = {
+    "pipe.SwitchIngress.cms_0",
+    "pipe.SwitchIngress.cms_1",
+    "pipe.SwitchIngress.cms_2"
+};
+
+static std::atomic<bool> g_quit{false};
+static void on_sigint(int) { g_quit.store(true); }
+
+struct Config {
+    double   epoch_seconds = 30.0;
+    uint32_t pipe_id       = 1;        // p4switch2 default
+    // Optional explicit overrides — comma-separated 3-ids each. If unset
+    // we resolve via the JSON parser in BfrtClient (which sometimes misses
+    // cms_2 because of an adjacent "id" field in the bfrt_info JSON).
+    std::vector<uint32_t> bf_ids_override;
+    std::vector<uint32_t> cms_ids_override;
+};
+
+static std::vector<uint32_t> parse_id_csv(const std::string& s) {
+    std::vector<uint32_t> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t j = s.find(',', i);
+        if (j == std::string::npos) j = s.size();
+        out.push_back((uint32_t)std::strtoul(s.substr(i, j - i).c_str(), nullptr, 10));
+        i = j + 1;
+    }
+    return out;
+}
+
+static Config parse_args(int argc, char** argv) {
+    Config c;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if      (a == "--epoch" && i + 1 < argc) c.epoch_seconds = std::stod(argv[++i]);
+        else if (a == "--pipe"  && i + 1 < argc) c.pipe_id = std::atoi(argv[++i]);
+        else if (a == "--bf-ids"  && i + 1 < argc) c.bf_ids_override  = parse_id_csv(argv[++i]);
+        else if (a == "--cms-ids" && i + 1 < argc) c.cms_ids_override = parse_id_csv(argv[++i]);
+        else if (a == "--help" || a == "-h") {
+            std::cout << "usage: " << argv[0]
+                      << " [--epoch SECS] [--pipe N]"
+                      << " [--bf-ids id0,id1,id2] [--cms-ids id0,id1,id2]\n";
+            std::exit(0);
+        }
+    }
+    return c;
+}
+
+// CMS index helpers (mirror Python control_plane.py exactly).
+static uint32_t master_bucket(const std::vector<uint8_t>& bytes) {
+    uint32_t h32 = polys::master.compute(bytes.data(), bytes.size());
+    uint32_t h16 = h32 & 0xFFFF;
+    return (h16 & 0xFC00) >> 10;     // 6-bit bucket id (0..63)
+}
+static uint32_t bf_idx(const Crc32& fn, const std::vector<uint8_t>& bytes) {
+    return fn.compute(bytes.data(), bytes.size()) & (kBfSize - 1);
+}
+static uint32_t cms_col(const Crc32& fn, const std::vector<uint8_t>& bytes) {
+    return fn.compute(bytes.data(), bytes.size()) & (kColsPerRow - 1);
+}
+
+int main(int argc, char** argv) {
+    // Self-test mode: compute CRC of "123456789" for every config and print
+    // hex output. Standard CRC test vectors say (from RevEng catalog):
+    //   CRC-32       (poly 0x04C11DB7, refl, init=FFFF.., xor=FFFF..) -> 0xCBF43926
+    //   CRC-32/BZIP2 (poly 0x04C11DB7, !refl, init=FFFF.., xor=FFFF..) -> 0xFC891918
+    //   CRC-32C      (poly 0x1EDC6F41, refl, init=FFFF.., xor=FFFF..) -> 0xE3069283
+    //   CRC-32D      (poly 0xA833982B, refl, init=FFFF.., xor=FFFF..) -> 0x87315576
+    if (argc >= 2 && std::string(argv[1]) == "--selftest") {
+        const char* s = "123456789";
+        std::vector<uint8_t> b(s, s + 9);
+        auto test = [&](const char* name, const Crc32& fn, uint32_t want) {
+            uint32_t got = fn.compute(b.data(), b.size());
+            std::printf("  %-12s got=0x%08x  want=0x%08x  %s\n",
+                        name, got, want, got == want ? "OK" : "DIFFERS");
+        };
+        Crc32 crc32_std   {0x104C11DB7ULL, true,  0xFFFFFFFF, 0xFFFFFFFF};
+        Crc32 crc32_bzip2 {0x104C11DB7ULL, false, 0xFFFFFFFF, 0xFFFFFFFF};
+        Crc32 crc32c      {0x11EDC6F41ULL, true,  0xFFFFFFFF, 0xFFFFFFFF};
+        Crc32 crc32d      {0x1A833982BULL, true,  0xFFFFFFFF, 0xFFFFFFFF};
+        std::puts("Self-test: CRC of \"123456789\"");
+        test("CRC-32",       crc32_std,   0xCBF43926);
+        test("CRC-32/BZIP2", crc32_bzip2, 0xFC891918);
+        test("CRC-32C",      crc32c,      0xE3069283);
+        test("CRC-32D",      crc32d,      0x87315576);
+        return 0;
+    }
+
+    Config cfg = parse_args(argc, argv);
+    std::signal(SIGINT, on_sigint);
+
+    std::cerr << "============================================================\n"
+              << "  hardware_version_cpp_lazy_BF — pure C++ control plane\n"
+              << "  bfrt-gRPC        : " << kAddr << "\n"
+              << "  P4 program       : " << kP4Name << "\n"
+              << "  Device / Pipe    : " << kDeviceId << " / " << cfg.pipe_id << "\n"
+              << "  Epoch length     : " << cfg.epoch_seconds << " s\n"
+              << "  BF cells per row : " << kBfSize << "\n"
+              << "  CMS cells per row: " << kCmsSize
+              << " (64 buckets * 1024 cols)\n"
+              << "============================================================\n";
+
+    BfrtClient client(kAddr, kP4Name, kDeviceId, kClientId, cfg.pipe_id);
+    if (!client.connect_and_bind()) return 1;
+
+    uint32_t bf_ids[3], cms_ids[3];
+    for (size_t i = 0; i < 3; ++i) {
+        if (cfg.bf_ids_override.size() == 3) {
+            bf_ids[i] = cfg.bf_ids_override[i];
+        } else if (!client.resolve_table_id(kBfNames[i], bf_ids[i])) {
+            std::cerr << "[main] cannot resolve " << kBfNames[i] << "\n"; return 1;
+        }
+        if (cfg.cms_ids_override.size() == 3) {
+            cms_ids[i] = cfg.cms_ids_override[i];
+        } else if (!client.resolve_table_id(kCmsNames[i], cms_ids[i])) {
+            std::cerr << "[main] cannot resolve " << kCmsNames[i] << "\n"; return 1;
+        }
+    }
+    std::cerr << "[main] BF  table ids : "
+              << bf_ids[0] << " " << bf_ids[1] << " " << bf_ids[2] << "\n";
+    std::cerr << "[main] CMS table ids : "
+              << cms_ids[0] << " " << cms_ids[1] << " " << cms_ids[2] << "\n";
+
+    FlowTable             flow_table;
+    std::mutex            flow_mu;
+    std::atomic<uint64_t> total_digests{0};
+
+    client.start_digest_stream([&](const FlowKey& k) {
+        std::lock_guard<std::mutex> lk(flow_mu);
+        flow_table[k] += 1;
+        uint64_t t = ++total_digests;
+        if (t % 5000 == 0) {
+            std::cerr << "  [" << t << " digests received, "
+                      << flow_table.size() << " unique flows]\n";
+        }
+    });
+
+    std::cerr << "[main] connected. waiting for packets...\n";
+    auto epoch_dur = std::chrono::milliseconds((int64_t)(cfg.epoch_seconds * 1000.0));
+    uint32_t epoch_num = 1;
+
+    while (!g_quit.load()) {
+        std::this_thread::sleep_for(epoch_dur);
+
+        // Snapshot (and detach) the current flow_table so digest collection
+        // continues into the next epoch's table while we process this one.
+        FlowTable snap;
+        {
+            std::lock_guard<std::mutex> lk(flow_mu);
+            snap.swap(flow_table);
+        }
+
+        std::cerr << "\n========================================================================\n"
+                  << "  EPOCH " << epoch_num << " END  -  "
+                  << snap.size() << " flows detected by BF\n"
+                  << "========================================================================\n";
+
+        if (snap.empty()) {
+            std::cerr << "  (no flows this epoch — skipping snapshot/clear)\n";
+            ++epoch_num;
+            continue;
+        }
+
+        auto t0 = std::chrono::steady_clock::now();
+
+        std::vector<std::vector<uint64_t>> bf(3), cms(3);
+        for (size_t i = 0; i < 3; ++i) {
+            if (!client.read_register(bf_ids[i],  kBfSize,  bf[i]))  return 1;
+            if (!client.read_register(cms_ids[i], kCmsSize, cms[i])) return 1;
+        }
+
+        auto t1 = std::chrono::steady_clock::now();
+        double read_secs = std::chrono::duration<double>(t1 - t0).count();
+        std::cerr << "  bulk read time         : " << read_secs << " s\n";
+
+        // Diagnostic: how many cells are non-zero per row, and what's the sum?
+        for (size_t i = 0; i < 3; ++i) {
+            uint64_t sum = 0, nz = 0;
+            for (auto v : bf[i])  { if (v) { sum += v; ++nz; } }
+            std::cerr << "    bf_"  << i << " : " << nz
+                      << " non-zero cells, sum=" << sum << "\n";
+        }
+        for (size_t i = 0; i < 3; ++i) {
+            uint64_t sum = 0, nz = 0;
+            for (auto v : cms[i]) { if (v) { sum += v; ++nz; } }
+            std::cerr << "    cms_" << i << " : " << nz
+                      << " non-zero cells, sum=" << sum << "\n";
+        }
+
+        // CRC diagnostic: for each flow print its computed full CRC values
+        // (so we can compare with Python's verify_crc.py) + bucket + col +
+        // the CMS cell value at the computed (bucket << 10 | col) index.
+        std::cerr << "  --- CRC + index diagnostic per flow ---\n";
+        std::cerr << std::hex;
+        for (const auto& kv : snap) {
+            const FlowKey& k = kv.first;
+            auto bytes = pack_5tuple(k.src_ip, k.dst_ip, k.proto,
+                                      k.src_port, k.dst_port);
+            uint32_t mh = polys::master.compute(bytes.data(), bytes.size());
+            uint32_t c0_full = polys::cms0.compute(bytes.data(), bytes.size());
+            uint32_t c1_full = polys::cms1.compute(bytes.data(), bytes.size());
+            uint32_t c2_full = polys::cms2.compute(bytes.data(), bytes.size());
+            uint32_t bucket = ((mh & 0xFFFF) & 0xFC00) >> 10;
+            uint32_t c0 = c0_full & 0x3FF;
+            uint32_t c1 = c1_full & 0x3FF;
+            uint32_t c2 = c2_full & 0x3FF;
+            uint32_t off = bucket << 10;
+            std::cerr << "    " << k.to_string() << std::dec
+                      << "  bucket=" << bucket
+                      << " col0=" << c0 << " col1=" << c1 << " col2=" << c2
+                      << " cms_vals=("
+                      << cms[0][off | c0] << ","
+                      << cms[1][off | c1] << ","
+                      << cms[2][off | c2] << ")"
+                      << std::hex
+                      << "  raw[ master=0x" << mh
+                      << " cms0=0x" << c0_full
+                      << " cms1=0x" << c1_full
+                      << " cms2=0x" << c2_full
+                      << " ]\n";
+        }
+        std::cerr << std::dec;
+
+        // Per-flow estimate: digests + min(CMS rows). This is the lazy-BF
+        // formula — for visible flows with <=3 packets CMS_min should be 0;
+        // for elephant flows it tracks the post-3rd-packet count.
+        uint64_t epoch_digests = 0, epoch_packets = 0;
+        uint64_t bucket_load[64] = {0};
+        for (const auto& kv : snap) {
+            const FlowKey& k = kv.first;
+            uint32_t dcount  = kv.second;
+            epoch_digests += dcount;
+
+            auto bytes = pack_5tuple(k.src_ip, k.dst_ip, k.proto,
+                                      k.src_port, k.dst_port);
+            uint32_t bucket = master_bucket(bytes);
+            uint32_t off    = bucket << 10;
+            uint32_t i0 = off | cms_col(polys::cms0, bytes);
+            uint32_t i1 = off | cms_col(polys::cms1, bytes);
+            uint32_t i2 = off | cms_col(polys::cms2, bytes);
+            uint64_t cms_min = std::min({cms[0][i0], cms[1][i1], cms[2][i2]});
+            epoch_packets += dcount + cms_min;
+            bucket_load[bucket] += 1;
+        }
+        uint64_t max_bucket = 0;
+        for (auto v : bucket_load) if (v > max_bucket) max_bucket = v;
+        double   max_load   = (double)max_bucket / kColsPerRow;
+
+        std::cerr << "  Total flows            : " << snap.size() << "\n"
+                  << "  Epoch digests          : " << epoch_digests << "\n"
+                  << "  Estimated packets      : " << epoch_packets
+                  << "  (digests + CMS)\n"
+                  << "  Max sub-sketch load    : " << max_load
+                  << "  (max bucket = " << max_bucket << " / "
+                  << kColsPerRow << " cols)\n";
+
+        std::cerr << "  Clearing BF + CMS registers (targeted, non-zero only)...\n";
+        auto t2 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < 3; ++i) {
+            std::vector<uint32_t> nz;
+            nz.reserve(bf[i].size() / 16);
+            for (uint32_t k = 0; k < bf[i].size(); ++k)
+                if (bf[i][k]) nz.push_back(k);
+            client.clear_register_indices(bf_ids[i], nz, /*value_bytes=*/1);
+        }
+        for (size_t i = 0; i < 3; ++i) {
+            std::vector<uint32_t> nz;
+            nz.reserve(cms[i].size() / 16);
+            for (uint32_t k = 0; k < cms[i].size(); ++k)
+                if (cms[i][k]) nz.push_back(k);
+            client.clear_register_indices(cms_ids[i], nz, /*value_bytes=*/2);
+        }
+        auto t3 = std::chrono::steady_clock::now();
+        std::cerr << "  bulk clear time        : "
+                  << std::chrono::duration<double>(t3 - t2).count() << " s\n";
+
+        std::cerr << "========================================================================\n";
+        ++epoch_num;
+    }
+
+    std::cerr << "[main] shutting down\n";
+    client.stop_digest_stream();
+    return 0;
+}
