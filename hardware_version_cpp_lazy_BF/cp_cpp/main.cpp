@@ -243,39 +243,9 @@ int main(int argc, char** argv) {
                       << " non-zero cells, sum=" << sum << "\n";
         }
 
-        // CRC diagnostic: for each flow print its computed full CRC values
-        // (so we can compare with Python's verify_crc.py) + bucket + col +
-        // the CMS cell value at the computed (bucket << 10 | col) index.
-        std::cerr << "  --- CRC + index diagnostic per flow ---\n";
-        std::cerr << std::hex;
-        for (const auto& kv : snap) {
-            const FlowKey& k = kv.first;
-            auto bytes = pack_5tuple(k.src_ip, k.dst_ip, k.proto,
-                                      k.src_port, k.dst_port);
-            uint32_t mh = polys::master.compute(bytes.data(), bytes.size());
-            uint32_t c0_full = polys::cms0.compute(bytes.data(), bytes.size());
-            uint32_t c1_full = polys::cms1.compute(bytes.data(), bytes.size());
-            uint32_t c2_full = polys::cms2.compute(bytes.data(), bytes.size());
-            uint32_t bucket = ((mh & 0xFFFF) & 0xFC00) >> 10;
-            uint32_t c0 = c0_full & 0x3FF;
-            uint32_t c1 = c1_full & 0x3FF;
-            uint32_t c2 = c2_full & 0x3FF;
-            uint32_t off = bucket << 10;
-            std::cerr << "    " << k.to_string() << std::dec
-                      << "  bucket=" << bucket
-                      << " col0=" << c0 << " col1=" << c1 << " col2=" << c2
-                      << " cms_vals=("
-                      << cms[0][off | c0] << ","
-                      << cms[1][off | c1] << ","
-                      << cms[2][off | c2] << ")"
-                      << std::hex
-                      << "  raw[ master=0x" << mh
-                      << " cms0=0x" << c0_full
-                      << " cms1=0x" << c1_full
-                      << " cms2=0x" << c2_full
-                      << " ]\n";
-        }
-        std::cerr << std::dec;
+        // (Per-flow CRC/index diagnostic removed — was useful for the 6-flow
+        // probe but spams the terminal at line-rate scale. Re-enable it
+        // behind a flag if you ever need to debug index computation again.)
 
         // Per-flow estimate via the sub-sketch equation solver.
         // 1) Group flows by master-hash bucket; for each flow precompute its
@@ -321,9 +291,21 @@ int main(int argc, char** argv) {
             if (buckets[b].empty()) continue;
             ++total_used_buckets;
             if (buckets[b].size() > max_bucket_flows) max_bucket_flows = buckets[b].size();
-            SolverResult r = solve_bucket(buckets[b], bucket_cells[b], cms_arr);
-            if (r.exact) ++exact_buckets;
-            else         ++fallback_buckets;
+
+            // Cheap early-out: if this bucket already has more flows than the
+            // sub-sketch has columns per row, the solver is provably under-
+            // determined (rank can't exceed kColsPerRow * 3). Skip the
+            // O(n^3) Gauss-Jordan and go straight to the min(cms_rows)
+            // fallback.
+            SolverResult r;
+            if (buckets[b].size() > kColsPerRow) {
+                r.exact = false;
+                ++fallback_buckets;
+            } else {
+                r = solve_bucket(buckets[b], bucket_cells[b], cms_arr);
+                if (r.exact) ++exact_buckets;
+                else         ++fallback_buckets;
+            }
             for (size_t j = 0; j < buckets[b].size(); ++j) {
                 uint64_t v;
                 if (r.exact) {
