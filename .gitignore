@@ -12,4 +12,17 @@ __pycache__/
 # Log files
 logs/
 *.log
+*.log.[0-9]*
+bf_drivers.log*
 zlog-cfg-cur
+
+# Tofino model output dumps
+model_*.log
+
+# Test pcap (regenerable)
+test_packets.pcap
+
+# Build artifacts inside any cp_cpp / fast_io
+**/build_gen/
+**/lazy_bf_cp
+**/fast_io/fast_io
