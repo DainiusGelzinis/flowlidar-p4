@@ -22,7 +22,9 @@ model_*.log
 # Test pcap (regenerable)
 test_packets.pcap
 
-# Build artifacts inside any cp_cpp / fast_io
+# Build artifacts from the C++ control plane
 **/build_gen/
 **/lazy_bf_cp
+**/lazy_bf262k_cp
+**/traditional_bf_cp
 **/fast_io/fast_io

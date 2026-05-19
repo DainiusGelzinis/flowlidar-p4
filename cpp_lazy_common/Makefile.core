@@ -1,22 +1,43 @@
-# Makefile — pure C++ control plane for hardware_version_cpp_lazy_BF.
+# Makefile.core — shared build rules for the lazy-BF C++ control plane.
+#
+# Usage: a variant's Makefile sets three variables and includes this file:
+#
+#     BF_SIZE := 131072
+#     P4_NAME := lazy_bf
+#     BINARY  := lazy_bf_cp
+#     include ../cpp_lazy_common/Makefile.core
+#
+# Sources live in cpp_lazy_common/ but the build runs in the variant
+# directory ($(CURDIR)) — generated artifacts and the final binary land
+# there, so each variant has its own build_gen/ and binary.
 #
 # Targets two SDE flavours without modification:
 #   - open-p4studio (simulator, SDE 9.13.4): paths under $SDE/install
 #   - bf-sde-9.11.0 (p4switch2 hardware):   paths under $SDE/install
-# Both expose $SDE / $SDE_INSTALL — the make uses those.
+# Both expose $SDE / $SDE_INSTALL — the build uses those.
 #
-# Self-contained on the proto side: a minimal google.rpc.Status proto
-# stub is generated inline (see STATUS_PROTO rule below) so we don't
-# depend on the SDE's pkgsrc/ tree (which is missing on most binary-
-# installed switches) and don't need to vendor a third-party file.
+# The google.rpc.Status stub bfruntime.proto imports is inline-generated
+# (see STATUS_PROTO rule) — no vendored proto/ tree.
+
+ifndef BF_SIZE
+$(error BF_SIZE must be set by the including Makefile (e.g. BF_SIZE := 131072))
+endif
+ifndef P4_NAME
+$(error P4_NAME must be set by the including Makefile (e.g. P4_NAME := lazy_bf))
+endif
+ifndef BINARY
+$(error BINARY must be set by the including Makefile (e.g. BINARY := lazy_bf_cp))
+endif
 
 SDE          ?= $(error SDE not set; export SDE=/path/to/SDE first)
 SDE_INSTALL  ?= $(SDE)/install
 
+# Absolute path to this Makefile's directory (= cpp_lazy_common/).
+SRC_DIR      := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+
 PROTOC       := $(SDE_INSTALL)/bin/protoc
 GRPC_PLUGIN  := $(SDE_INSTALL)/bin/grpc_cpp_plugin
 
-# Look for bfruntime.proto in known SDE locations.
 BFRT_PROTO_CANDIDATES := \
     $(SDE_INSTALL)/share/bf_rt_shared/proto/bfruntime.proto \
     $(SDE_INSTALL)/share/bfsys/proto/bfruntime.proto \
@@ -28,10 +49,7 @@ $(error bfruntime.proto not found; tried: $(BFRT_PROTO_CANDIDATES))
 endif
 BFRT_DIR     := $(dir $(BFRT_PROTO))
 
-# Inline-generated minimal stub for google.rpc.Status — bfruntime.proto
-# imports it but the SDE often doesn't ship it. We write a 12-line
-# proto3 stub at build time so there is nothing to vendor in this tree.
-GEN_DIR      := build_gen
+GEN_DIR        := build_gen
 STUB_PROTO_DIR := $(GEN_DIR)/proto
 STATUS_PROTO   := $(STUB_PROTO_DIR)/google/rpc/status.proto
 
@@ -42,32 +60,36 @@ GEN_SRCS     := $(GEN_DIR)/bfruntime.pb.cc \
 CXX          := g++
 CXXFLAGS     := -std=c++17 -O2 -Wall \
                 -I$(SDE_INSTALL)/include \
-                -I$(GEN_DIR)
+                -I$(GEN_DIR) \
+                -I$(SRC_DIR) \
+                -DLAZY_BF_SIZE=$(BF_SIZE) \
+                -DLAZY_P4_NAME=\"$(P4_NAME)\"
+
 PKGCONFIG    := PKG_CONFIG_PATH=$(SDE_INSTALL)/lib/pkgconfig pkg-config
 LDFLAGS      := -L$(SDE_INSTALL)/lib \
                 -Wl,-rpath,$(SDE_INSTALL)/lib \
                 -Wl,--copy-dt-needed-entries
 
-# Prefer pkg-config; fall back to a hand-rolled list if the SDE doesn't
-# ship .pc files.
 GRPC_LIBS    := $(shell $(PKGCONFIG) --libs grpc++ 2>/dev/null)
 ifeq ($(strip $(GRPC_LIBS)),)
 GRPC_LIBS    := -lgrpc++ -lgrpc -lgpr -labsl_synchronization
 endif
 LIBS         := $(GRPC_LIBS) -lgrpc++_reflection -lprotobuf -lpthread
 
-TARGET       := lazy_bf262k_cp
-SRCS         := main.cpp bfrt_client.cpp solver.cpp $(GEN_SRCS)
+CORE_SRCS    := $(SRC_DIR)/main.cpp \
+                $(SRC_DIR)/bfrt_client.cpp \
+                $(SRC_DIR)/solver.cpp
+CORE_HDRS    := $(SRC_DIR)/bfrt_client.hpp \
+                $(SRC_DIR)/crc.hpp \
+                $(SRC_DIR)/flow.hpp \
+                $(SRC_DIR)/solver.hpp
 
-all: $(TARGET)
+all: $(BINARY)
 
-$(TARGET): $(SRCS) bfrt_client.hpp crc.hpp flow.hpp solver.hpp
-	$(CXX) $(CXXFLAGS) -o $@ main.cpp bfrt_client.cpp solver.cpp $(GEN_SRCS) \
+$(BINARY): $(CORE_SRCS) $(CORE_HDRS) $(GEN_SRCS)
+	$(CXX) $(CXXFLAGS) -o $@ $(CORE_SRCS) $(GEN_SRCS) \
 	    $(LDFLAGS) $(LIBS)
 
-# Generate C++ bfruntime stubs. The inline-generated status.proto stub
-# in $(STUB_PROTO_DIR) lets the `import "google/rpc/status.proto"` in
-# bfruntime.proto resolve without a vendored file in this tree.
 $(GEN_DIR)/bfruntime.pb.cc $(GEN_DIR)/bfruntime.grpc.pb.cc: \
         $(BFRT_PROTO) $(GEN_DIR)/google/rpc/status.pb.cc
 	mkdir -p $(GEN_DIR)
@@ -81,8 +103,7 @@ $(GEN_DIR)/google/rpc/status.pb.cc: $(STATUS_PROTO)
 	mkdir -p $(GEN_DIR)/google/rpc
 	$(PROTOC) -I$(STUB_PROTO_DIR) --cpp_out=$(GEN_DIR) $(STATUS_PROTO)
 
-# Inline stub — only the Status message itself is load-bearing; the
-# rest of the upstream file is licence headers / java options / docs.
+# Inline stub — only the Status message itself is load-bearing.
 # bfruntime.proto only uses `.google.rpc.Status` as a field type.
 $(STATUS_PROTO):
 	@mkdir -p $(dir $@)
@@ -96,16 +117,17 @@ $(STATUS_PROTO):
 	    '  repeated google.protobuf.Any details = 3;' \
 	    '}' > $@
 
-# Print which versions / paths we resolved — useful when debugging on hw.
 diag:
+	@echo "SRC_DIR     = $(SRC_DIR)"
+	@echo "BINARY      = $(BINARY)"
+	@echo "BF_SIZE     = $(BF_SIZE)"
+	@echo "P4_NAME     = $(P4_NAME)"
 	@echo "SDE         = $(SDE)"
 	@echo "SDE_INSTALL = $(SDE_INSTALL)"
-	@echo "PROTOC      = $(PROTOC)"
-	@echo "GRPC_PLUGIN = $(GRPC_PLUGIN)"
 	@echo "BFRT_PROTO  = $(BFRT_PROTO)"
 	@echo "GRPC_LIBS   = $(GRPC_LIBS)"
 
 clean:
-	rm -rf $(TARGET) $(GEN_DIR)
+	rm -rf $(BINARY) $(GEN_DIR)
 
 .PHONY: all clean diag

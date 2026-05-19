@@ -1,8 +1,12 @@
-// main.cpp — pure C++ control plane for cpp_traditional_bf131k_cms64x1024.
+// main.cpp — shared traditional-BF control plane for the
+// cpp_traditional_bf*_cms64x1024 variants. The including Makefile
+// (cpp_traditional_common/Makefile.core) injects TRAD_BF_SIZE and
+// TRAD_P4_NAME at compile time so the same source builds against any
+// (BF size, P4 program name) pair.
 //
 // What it does:
 //   - Connects to bfrt-grpc on localhost:50052
-//   - Subscribes + binds to the P4 program "traditional_bf"
+//   - Subscribes + binds to the P4 program named by TRAD_P4_NAME
 //   - Reads digests off the StreamChannel into a flow_table. Traditional BF
 //     fires at most ONE digest per visible flow (the packet that first sets
 //     any of the 3 BF bits) — so flow_table[k] is ~1 for every visible flow.
@@ -38,13 +42,20 @@
 #include <array>
 #include <unordered_map>
 
+#ifndef TRAD_BF_SIZE
+#error "TRAD_BF_SIZE must be defined at build time (e.g. -DTRAD_BF_SIZE=131072)"
+#endif
+#ifndef TRAD_P4_NAME
+#error "TRAD_P4_NAME must be defined at build time (e.g. -DTRAD_P4_NAME=\"traditional_bf\")"
+#endif
+
 static constexpr const char* kAddr      = "localhost:50052";
-static constexpr const char* kP4Name    = "traditional_bf";
+static constexpr const char* kP4Name    = TRAD_P4_NAME;
 static constexpr uint32_t    kDeviceId  = 0;
 static constexpr uint32_t    kClientId  = 0;
 
-static constexpr uint32_t    kBfSize    = 131072;   // 2^17 cells per BF row
-static constexpr uint32_t    kCmsSize   = 65536;    // 64 buckets * 1024 cols
+static constexpr uint32_t    kBfSize    = TRAD_BF_SIZE;  // per-row BF cells
+static constexpr uint32_t    kCmsSize   = 65536;         // 64 buckets * 1024 cols
 static constexpr uint32_t    kColsPerRow = 1024;
 
 static const std::vector<std::string> kBfNames = {
@@ -144,7 +155,8 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_sigint);
 
     std::cerr << "============================================================\n"
-              << "  cpp_traditional_bf131k_cms64x1024 — pure C++ control plane\n"
+              << "  cpp_traditional_common — pure C++ control plane (P4: "
+              << kP4Name << ")\n"
               << "  bfrt-gRPC        : " << kAddr << "\n"
               << "  P4 program       : " << kP4Name << "\n"
               << "  Device / Pipe    : " << kDeviceId << " / " << cfg.pipe_id << "\n"

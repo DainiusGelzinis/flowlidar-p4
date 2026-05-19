@@ -1,23 +1,21 @@
-// main.cpp — pure C++ control plane for hardware_version_cpp_lazy_BF.
+// main.cpp — shared lazy-BF control plane for the cpp_lazy_bf*_cms64x1024
+// variants. The including Makefile (cpp_lazy_common/Makefile.core) injects
+// LAZY_BF_SIZE and LAZY_P4_NAME at compile time so the same source builds
+// against any (BF size, P4 program name) pair.
 //
 // What it does:
 //   - Connects to bfrt-grpc on localhost:50052
-//   - Subscribes + binds to the P4 program "lazy_bf262k"
+//   - Subscribes + binds to the P4 program named by LAZY_P4_NAME
 //   - Reads digests off the StreamChannel into a flow_table (lazy BF: each
 //     visible flow generates 1, 2, or 3 digests).
 //   - Every --epoch seconds:
 //       * Bulk-reads the 3 BF + 3 CMS register tables.
-//       * For each visible flow computes per-flow packet count =
-//             digest_count + min(cms_0[idx0], cms_1[idx1], cms_2[idx2]).
+//       * For each visible flow runs Alg 4 (1/2-pkt mice via BF state),
+//         then Alg 5 (3-pkt flows via CMS == 0), then the sub-sketch
+//         equation solver (Exact / Algorithm 6 / min(cms_rows) fallback
+//         when n > kColsPerRow).
 //       * Prints a one-line summary (flows, digests, est. packets, max load).
 //       * Bulk-clears all 6 register tables.
-//
-// Pure C++ in a single process, so we own the only bfrt-grpc client_id 0
-// session. Per-flow estimate runs the sub-sketch equation solver (see
-// solver.hpp); buckets that turn out under-determined fall back to
-// min(cms_rows) for safety. Algorithms 4/5 (digest-count classification)
-// not implemented — the lazy-BF expected-digest-count optimisation is a
-// future enhancement.
 
 #include <atomic>
 #include <chrono>
@@ -39,13 +37,20 @@
 #include <array>
 #include <unordered_map>
 
+#ifndef LAZY_BF_SIZE
+#error "LAZY_BF_SIZE must be defined at build time (e.g. -DLAZY_BF_SIZE=131072)"
+#endif
+#ifndef LAZY_P4_NAME
+#error "LAZY_P4_NAME must be defined at build time (e.g. -DLAZY_P4_NAME=\"lazy_bf\")"
+#endif
+
 static constexpr const char* kAddr      = "localhost:50052";
-static constexpr const char* kP4Name    = "lazy_bf262k";
+static constexpr const char* kP4Name    = LAZY_P4_NAME;
 static constexpr uint32_t    kDeviceId  = 0;
 static constexpr uint32_t    kClientId  = 0;
 
-static constexpr uint32_t    kBfSize    = 262144;   // 2^18 cells per BF row (doubled vs 131k variant)
-static constexpr uint32_t    kCmsSize   = 65536;    // 64 buckets * 1024 cols
+static constexpr uint32_t    kBfSize    = LAZY_BF_SIZE;  // per-row BF cells
+static constexpr uint32_t    kCmsSize   = 65536;         // 64 buckets * 1024 cols
 static constexpr uint32_t    kColsPerRow = 1024;
 
 static const std::vector<std::string> kBfNames = {
@@ -146,7 +151,8 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_sigint);
 
     std::cerr << "============================================================\n"
-              << "  hardware_version_cpp_lazy_BF — pure C++ control plane\n"
+              << "  cpp_lazy_common — pure C++ control plane (P4: "
+              << kP4Name << ")\n"
               << "  bfrt-gRPC        : " << kAddr << "\n"
               << "  P4 program       : " << kP4Name << "\n"
               << "  Device / Pipe    : " << kDeviceId << " / " << cfg.pipe_id << "\n"

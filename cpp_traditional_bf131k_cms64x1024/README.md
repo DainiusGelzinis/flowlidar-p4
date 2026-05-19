@@ -8,9 +8,10 @@ exactly one digest per visible flow.
 - **Data plane**: traditional BF (3 × **131072** × 1 bit, bit<17>, all rows
   always check-and-set) + sub-sketch CMS (3 × 65536 × 16-bit, 64 buckets ×
   1024 cols). Same BF / CMS sizes as the 131k lazy variant.
-- **Control plane**: a single C++ binary (`cp_cpp/traditional_bf_cp`) that
-  owns the bfrt-grpc client_id 0 session, receives digests, runs per-epoch
-  bulk read+clear, and reports flow counts.
+- **Control plane**: a single C++ binary (`./traditional_bf_cp`) built
+  from the shared `../cpp_traditional_common/` sources. Owns the
+  bfrt-grpc client_id 0 session, receives digests, runs per-epoch bulk
+  read+clear, and reports flow counts.
 - **Algorithms 4 / 5 are disabled here**: every packet flips all 3 BF rows,
   so a 1-pkt mouse and an N-pkt elephant produce identical BF state. Every
   visible flow goes straight to the sub-sketch equation solver (with
@@ -23,21 +24,20 @@ variant — same BF/CMS dimensions, same C++ CP, only the BF semantics differ.
 
 ```
 cpp_traditional_bf131k_cms64x1024/
-├── traditional_bf.p4    P4 (traditional BF + sub-sketch CMS)
-├── build.sh             compiles traditional_bf.p4 with bf-p4c
-├── setup_table.py       bfshell one-shot — port enables, LPM, CMS gates
-├── print_ids.py         dumps bfrt register table IDs (run as plain Python)
-├── test_packet.py       local 6-flow correctness probe (scapy, sudo)
-├── verify_crc.py        CRC parity check
-├── README.md            this file
-└── cp_cpp/
-    ├── Makefile         builds traditional_bf_cp using bfrt-grpc + auto-generated stubs
-    ├── main.cpp         entrypoint + per-epoch loop (no Algs 4/5)
-    ├── bfrt_client.{hpp,cpp}  gRPC wrapper: subscribe, BIND, register I/O, digests
-    ├── crc.hpp          CRC-32 family hashes matching traditional_bf.p4
-    ├── flow.hpp         5-tuple flow key
-    └── solver.{hpp,cpp} sub-sketch equation solver (Exact / Alg6 / min fallback)
+├── traditional_bf.p4   P4 (traditional BF + sub-sketch CMS)
+├── build.sh            compiles traditional_bf.p4 with bf-p4c
+├── setup_table.py      bfshell one-shot — port enables, LPM, CMS gates
+├── print_ids.py        dumps bfrt register table IDs
+├── test_packet.py      local 6-flow correctness probe
+├── verify_crc.py       CRC parity check
+├── Makefile            4-line stub: BF_SIZE=131072, P4_NAME=traditional_bf, BINARY=traditional_bf_cp
+├── README.md           this file
+└── results.md          measured numbers on real hardware
 ```
+
+Shared sources live in `../cpp_traditional_common/` (separate from the
+lazy core because Algs 4/5 don't apply when every packet flips all 3
+BF rows).
 
 ## Build
 
@@ -46,7 +46,7 @@ On the switch (with `$SDE` and `$SDE_INSTALL` exported):
 ```bash
 cd ~/dainius/cpp_traditional_bf131k_cms64x1024
 ./build.sh                   # compiles traditional_bf.p4 with bf-p4c
-cd cp_cpp && make            # builds traditional_bf_cp
+make                         # builds ./traditional_bf_cp from ../cpp_traditional_common/
 ```
 
 ## Run
@@ -73,7 +73,7 @@ python3 ~/dainius/cpp_traditional_bf131k_cms64x1024/print_ids.py
 
 ### T2c — C++ control plane
 ```bash
-~/dainius/cpp_traditional_bf131k_cms64x1024/cp_cpp/traditional_bf_cp \
+~/dainius/cpp_traditional_bf131k_cms64x1024/traditional_bf_cp \
     --epoch 15 --pipe 1 \
     --bf-ids  <from print_ids.py> \
     --cms-ids <from print_ids.py>
