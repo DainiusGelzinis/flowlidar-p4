@@ -5,9 +5,10 @@
 #   - bf-sde-9.11.0 (p4switch2 hardware):   paths under $SDE/install
 # Both expose $SDE / $SDE_INSTALL — the make uses those.
 #
-# Self-contained on the proto side: status.proto is shipped in proto/google/rpc/
-# so we don't depend on the SDE's pkgsrc/ tree (which is missing on most
-# binary-installed switches).
+# Self-contained on the proto side: a minimal google.rpc.Status proto
+# stub is generated inline (see STATUS_PROTO rule below) so we don't
+# depend on the SDE's pkgsrc/ tree (which is missing on most binary-
+# installed switches) and don't need to vendor a third-party file.
 
 SDE          ?= $(error SDE not set; export SDE=/path/to/SDE first)
 SDE_INSTALL  ?= $(SDE)/install
@@ -27,10 +28,13 @@ $(error bfruntime.proto not found; tried: $(BFRT_PROTO_CANDIDATES))
 endif
 BFRT_DIR     := $(dir $(BFRT_PROTO))
 
-# Bundled deps so we don't need SDE pkgsrc (often absent on real hw).
-LOCAL_PROTO  := proto
-
+# Inline-generated minimal stub for google.rpc.Status — bfruntime.proto
+# imports it but the SDE often doesn't ship it. We write a 12-line
+# proto3 stub at build time so there is nothing to vendor in this tree.
 GEN_DIR      := build_gen
+STUB_PROTO_DIR := $(GEN_DIR)/proto
+STATUS_PROTO   := $(STUB_PROTO_DIR)/google/rpc/status.proto
+
 GEN_SRCS     := $(GEN_DIR)/bfruntime.pb.cc \
                 $(GEN_DIR)/bfruntime.grpc.pb.cc \
                 $(GEN_DIR)/google/rpc/status.pb.cc
@@ -61,21 +65,36 @@ $(TARGET): $(SRCS) bfrt_client.hpp crc.hpp flow.hpp solver.hpp
 	$(CXX) $(CXXFLAGS) -o $@ main.cpp bfrt_client.cpp solver.cpp $(GEN_SRCS) \
 	    $(LDFLAGS) $(LIBS)
 
-# Generate C++ bfruntime stubs. We pass both the proto's own dir and the
-# bundled proto/ as include paths so the import "google/rpc/status.proto"
-# resolves locally.
+# Generate C++ bfruntime stubs. The inline-generated status.proto stub
+# in $(STUB_PROTO_DIR) lets the `import "google/rpc/status.proto"` in
+# bfruntime.proto resolve without a vendored file in this tree.
 $(GEN_DIR)/bfruntime.pb.cc $(GEN_DIR)/bfruntime.grpc.pb.cc: \
         $(BFRT_PROTO) $(GEN_DIR)/google/rpc/status.pb.cc
 	mkdir -p $(GEN_DIR)
-	$(PROTOC) -I$(BFRT_DIR) -I$(LOCAL_PROTO) \
+	$(PROTOC) -I$(BFRT_DIR) -I$(STUB_PROTO_DIR) \
 	          --cpp_out=$(GEN_DIR) \
 	          --grpc_out=$(GEN_DIR) \
 	          --plugin=protoc-gen-grpc=$(GRPC_PLUGIN) \
 	          $(BFRT_PROTO)
 
-$(GEN_DIR)/google/rpc/status.pb.cc: $(LOCAL_PROTO)/google/rpc/status.proto
+$(GEN_DIR)/google/rpc/status.pb.cc: $(STATUS_PROTO)
 	mkdir -p $(GEN_DIR)/google/rpc
-	$(PROTOC) -I$(LOCAL_PROTO) --cpp_out=$(GEN_DIR) $(LOCAL_PROTO)/google/rpc/status.proto
+	$(PROTOC) -I$(STUB_PROTO_DIR) --cpp_out=$(GEN_DIR) $(STATUS_PROTO)
+
+# Inline stub — only the Status message itself is load-bearing; the
+# rest of the upstream file is licence headers / java options / docs.
+# bfruntime.proto only uses `.google.rpc.Status` as a field type.
+$(STATUS_PROTO):
+	@mkdir -p $(dir $@)
+	@printf '%s\n' \
+	    'syntax = "proto3";' \
+	    'package google.rpc;' \
+	    'import "google/protobuf/any.proto";' \
+	    'message Status {' \
+	    '  int32 code = 1;' \
+	    '  string message = 2;' \
+	    '  repeated google.protobuf.Any details = 3;' \
+	    '}' > $@
 
 # Print which versions / paths we resolved — useful when debugging on hw.
 diag:
