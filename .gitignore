@@ -27,6 +27,12 @@ test_packets.pcap
 **/lazy_bf_cp
 **/lazy_bf262k_cp
 **/lazy_bf262k_cms2048_cp
+**/lazy_bf524k_cp
+**/lazy_bf1m_cp
+**/lazy_bf2m_cp
+**/lazy_bf1m_cms64x4096_cp
+**/lazy_bf1m_cms128x2048_cp
 **/lazy_bf1m_cms256x1024_cp
 **/traditional_bf_cp
+**/traditional_bf1m_cms256x1024_cp
 **/fast_io/fast_io
