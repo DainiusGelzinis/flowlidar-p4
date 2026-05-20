@@ -26,5 +26,6 @@ test_packets.pcap
 **/build_gen/
 **/lazy_bf_cp
 **/lazy_bf262k_cp
+**/lazy_bf262k_cms2048_cp
 **/traditional_bf_cp
 **/fast_io/fast_io

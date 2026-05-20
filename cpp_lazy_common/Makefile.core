@@ -1,11 +1,16 @@
 # Makefile.core — shared build rules for the lazy-BF C++ control plane.
 #
-# Usage: a variant's Makefile sets three variables and includes this file:
+# Usage: a variant's Makefile sets these five variables and includes this file:
 #
-#     BF_SIZE := 131072
-#     P4_NAME := lazy_bf
-#     BINARY  := lazy_bf_cp
+#     BF_SIZE     := 131072
+#     CMS_BUCKETS := 64
+#     CMS_COLS    := 1024
+#     P4_NAME     := lazy_bf
+#     BINARY      := lazy_bf_cp
 #     include ../cpp_lazy_common/Makefile.core
+#
+# CMS_BUCKETS and CMS_COLS must both be powers of two (compile-time
+# asserted in main.cpp).
 #
 # Sources live in cpp_lazy_common/ but the build runs in the variant
 # directory ($(CURDIR)) — generated artifacts and the final binary land
@@ -21,6 +26,12 @@
 
 ifndef BF_SIZE
 $(error BF_SIZE must be set by the including Makefile (e.g. BF_SIZE := 131072))
+endif
+ifndef CMS_BUCKETS
+$(error CMS_BUCKETS must be set by the including Makefile (e.g. CMS_BUCKETS := 64))
+endif
+ifndef CMS_COLS
+$(error CMS_COLS must be set by the including Makefile (e.g. CMS_COLS := 1024))
 endif
 ifndef P4_NAME
 $(error P4_NAME must be set by the including Makefile (e.g. P4_NAME := lazy_bf))
@@ -63,6 +74,8 @@ CXXFLAGS     := -std=c++17 -O2 -Wall \
                 -I$(GEN_DIR) \
                 -I$(SRC_DIR) \
                 -DLAZY_BF_SIZE=$(BF_SIZE) \
+                -DLAZY_CMS_BUCKETS=$(CMS_BUCKETS) \
+                -DLAZY_CMS_COLS=$(CMS_COLS) \
                 -DLAZY_P4_NAME=\"$(P4_NAME)\"
 
 PKGCONFIG    := PKG_CONFIG_PATH=$(SDE_INSTALL)/lib/pkgconfig pkg-config
@@ -121,6 +134,8 @@ diag:
 	@echo "SRC_DIR     = $(SRC_DIR)"
 	@echo "BINARY      = $(BINARY)"
 	@echo "BF_SIZE     = $(BF_SIZE)"
+	@echo "CMS_BUCKETS = $(CMS_BUCKETS)"
+	@echo "CMS_COLS    = $(CMS_COLS)"
 	@echo "P4_NAME     = $(P4_NAME)"
 	@echo "SDE         = $(SDE)"
 	@echo "SDE_INSTALL = $(SDE_INSTALL)"

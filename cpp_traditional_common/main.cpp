@@ -48,15 +48,32 @@
 #ifndef TRAD_P4_NAME
 #error "TRAD_P4_NAME must be defined at build time (e.g. -DTRAD_P4_NAME=\"traditional_bf\")"
 #endif
+#ifndef TRAD_CMS_BUCKETS
+#error "TRAD_CMS_BUCKETS must be defined at build time (e.g. -DTRAD_CMS_BUCKETS=64)"
+#endif
+#ifndef TRAD_CMS_COLS
+#error "TRAD_CMS_COLS must be defined at build time (e.g. -DTRAD_CMS_COLS=1024)"
+#endif
+
+// Compile-time log2 for power-of-two values.
+static constexpr uint32_t ilog2_pow2(uint32_t v) {
+    return v <= 1 ? 0 : 1 + ilog2_pow2(v >> 1);
+}
 
 static constexpr const char* kAddr      = "localhost:50052";
 static constexpr const char* kP4Name    = TRAD_P4_NAME;
 static constexpr uint32_t    kDeviceId  = 0;
 static constexpr uint32_t    kClientId  = 0;
 
-static constexpr uint32_t    kBfSize    = TRAD_BF_SIZE;  // per-row BF cells
-static constexpr uint32_t    kCmsSize   = 65536;         // 64 buckets * 1024 cols
-static constexpr uint32_t    kColsPerRow = 1024;
+static constexpr uint32_t    kBfSize      = TRAD_BF_SIZE;       // per-row BF cells
+static constexpr uint32_t    kCmsBuckets  = TRAD_CMS_BUCKETS;   // sub-sketch count
+static constexpr uint32_t    kColsPerRow  = TRAD_CMS_COLS;      // cols per sub-sketch
+static constexpr uint32_t    kCmsSize     = kCmsBuckets * kColsPerRow;
+static constexpr uint32_t    kBucketShift = ilog2_pow2(kColsPerRow);
+static constexpr uint32_t    kCmsIndexMask = kCmsSize - 1;
+
+static_assert((kColsPerRow & (kColsPerRow - 1)) == 0, "TRAD_CMS_COLS must be a power of 2");
+static_assert((kCmsBuckets & (kCmsBuckets - 1)) == 0, "TRAD_CMS_BUCKETS must be a power of 2");
 
 static const std::vector<std::string> kBfNames = {
     "pipe.SwitchIngress.bf_0",
@@ -115,8 +132,8 @@ static Config parse_args(int argc, char** argv) {
 // CMS index helpers (mirror Python control_plane.py exactly).
 static uint32_t master_bucket(const std::vector<uint8_t>& bytes) {
     uint32_t h32 = polys::master.compute(bytes.data(), bytes.size());
-    uint32_t h16 = h32 & 0xFFFF;
-    return (h16 & 0xFC00) >> 10;     // 6-bit bucket id (0..63)
+    uint32_t h   = h32 & kCmsIndexMask;     // truncate to CMS index width
+    return h >> kBucketShift;               // upper log2(kCmsBuckets) bits
 }
 // (Traditional BF doesn't need per-flow BF indices for classification —
 // every visible flow goes straight to the solver.)
@@ -163,7 +180,7 @@ int main(int argc, char** argv) {
               << "  Epoch length     : " << cfg.epoch_seconds << " s\n"
               << "  BF cells per row : " << kBfSize << "\n"
               << "  CMS cells per row: " << kCmsSize
-              << " (64 buckets * 1024 cols)\n"
+              << " (" << kCmsBuckets << " buckets * " << kColsPerRow << " cols)\n"
               << "============================================================\n";
 
     BfrtClient client(kAddr, kP4Name, kDeviceId, kClientId, cfg.pipe_id);
@@ -262,8 +279,8 @@ int main(int argc, char** argv) {
         // Algorithms 4 / 5 are NOT applicable — BF state after the epoch can't
         // distinguish a 1-pkt mouse from an N-pkt elephant because every
         // packet flips all 3 BF rows.
-        std::array<std::vector<FlowKey>, 64>                    buckets;
-        std::array<std::vector<std::array<std::pair<int,uint32_t>,3>>, 64> bucket_cells;
+        std::array<std::vector<FlowKey>, kCmsBuckets>                    buckets;
+        std::array<std::vector<std::array<std::pair<int,uint32_t>,3>>, kCmsBuckets> bucket_cells;
         std::array<std::vector<uint64_t>, 3> cms_arr{cms[0], cms[1], cms[2]};
 
         uint64_t epoch_digests = 0, epoch_packets = 0;
@@ -278,7 +295,7 @@ int main(int argc, char** argv) {
                                       k.src_port, k.dst_port);
 
             uint32_t bucket = master_bucket(bytes);
-            uint32_t off    = bucket << 10;
+            uint32_t off    = bucket << kBucketShift;
             std::array<std::pair<int,uint32_t>,3> cells = {{
                 {0, off | cms_col(polys::cms0, bytes)},
                 {1, off | cms_col(polys::cms1, bytes)},
@@ -295,7 +312,7 @@ int main(int argc, char** argv) {
         size_t   total_used_buckets = 0;
         uint64_t max_bucket_flows = 0;
         std::unordered_map<const FlowKey*, uint64_t> per_flow_cms;
-        for (size_t b = 0; b < 64; ++b) {
+        for (size_t b = 0; b < kCmsBuckets; ++b) {
             if (buckets[b].empty()) continue;
             ++total_used_buckets;
             if (buckets[b].size() > max_bucket_flows) max_bucket_flows = buckets[b].size();
@@ -338,7 +355,7 @@ int main(int argc, char** argv) {
                   << "  Equation solver / min fallback  : " << solver_input_count
                   << "  (" << pct(solver_input_count) << "%)\n"
                   << "  Sub-sketch buckets used: " << total_used_buckets
-                  << " / 64  (exact: " << exact_buckets
+                  << " / " << kCmsBuckets << "  (exact: " << exact_buckets
                   << ", Alg6 approx: " << alg6_buckets
                   << ", n>cols skip: " << skipped_buckets << ")\n"
                   << "  Max sub-sketch load    : " << max_load
