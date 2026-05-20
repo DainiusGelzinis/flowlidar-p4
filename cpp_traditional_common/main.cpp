@@ -212,7 +212,7 @@ int main(int argc, char** argv) {
         std::lock_guard<std::mutex> lk(flow_mu);
         flow_table[k] += 1;
         uint64_t t = ++total_digests;
-        if (t % 5000 == 0) {
+        if (t % 50000 == 0) {
             std::cerr << "  [" << t << " digests received, "
                       << flow_table.size() << " unique flows]\n";
         }
@@ -318,16 +318,15 @@ int main(int argc, char** argv) {
             if (buckets[b].size() > max_bucket_flows) max_bucket_flows = buckets[b].size();
 
             SolverResult r;
-            // Sub-sketch CMS has 3 rows of c cols => 3c independent counter
-            // equations. With n unknowns, the system is information-
-            // theoretically determined only when n <= 3c. Beyond that the
-            // matrix can't have full rank no matter what, so skip the build
-            // and use per-flow min(cms_rows) as the fallback.
-            //
-            // For n <= 3c the actual Exact-vs-Algorithm6 dispatch happens
-            // inside solve_bucket() based on the empirical matrix rank
-            // (not on a fixed n threshold).
-            if (buckets[b].size() > 3 * kColsPerRow) {
+            // Skip criteria, in order:
+            //   1. n > 3c: information-theoretic limit; no possible exact solve.
+            //   2. n > kSlowSolverCap: Algorithm 6 step B (LSQ via normal
+            //      equations) is O(n^2 * m) per bucket, which blows out
+            //      runtime at large n. Cap at 500 to keep solver wall-time
+            //      under a few seconds. Beyond cap -> min(cms_rows) fallback.
+            constexpr uint32_t kSlowSolverCap = 500;
+            if (buckets[b].size() > 3 * kColsPerRow ||
+                buckets[b].size() > kSlowSolverCap) {
                 r.path = SolverPath::Skipped;
                 ++skipped_buckets;
             } else {
@@ -364,7 +363,7 @@ int main(int argc, char** argv) {
                   << "  Sub-sketch buckets used: " << total_used_buckets
                   << " / " << kCmsBuckets << "  (exact: " << exact_buckets
                   << ", Alg6 approx: " << alg6_buckets
-                  << ", n>3*cols skip: " << skipped_buckets << ")\n"
+                  << ", skipped: " << skipped_buckets << ")\n"
                   << "  Max sub-sketch load    : " << max_load
                   << "  (max bucket = " << max_bucket_flows << " flows / "
                   << kColsPerRow << " cols)\n";
