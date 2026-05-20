@@ -351,9 +351,17 @@ int main(int argc, char** argv) {
             if (buckets[b].size() > max_bucket_flows) max_bucket_flows = buckets[b].size();
 
             SolverResult r;
-            if (buckets[b].size() > kColsPerRow) {
-                // Way too underdetermined for Alg 6 to help — skip the
-                // matrix build entirely and use per-flow min(cms_rows).
+            // Sub-sketch CMS has 3 rows of c cols => 3c independent counter
+            // equations. With n unknowns, the system is information-
+            // theoretically determined only when n <= 3c. Beyond that the
+            // matrix can't have full rank no matter what, so skip the build
+            // and use per-flow min(cms_rows) as the fallback.
+            //
+            // For n <= 3c the actual Exact-vs-Algorithm6 dispatch happens
+            // inside solve_bucket() based on the empirical matrix rank
+            // (not on a fixed n threshold). Buckets where rank == n run
+            // Gauss-Jordan exact; the rest fall through to Algorithm 6.
+            if (buckets[b].size() > 3 * kColsPerRow) {
                 r.path = SolverPath::Skipped;
                 ++skipped_buckets;
             } else {
@@ -394,7 +402,7 @@ int main(int argc, char** argv) {
                   << "  Sub-sketch buckets used: " << total_used_buckets
                   << " / " << kCmsBuckets << "  (exact: " << exact_buckets
                   << ", Alg6 approx: " << alg6_buckets
-                  << ", n>cols skip: " << skipped_buckets << ")\n"
+                  << ", n>3*cols skip: " << skipped_buckets << ")\n"
                   << "  Max sub-sketch load    : " << max_load
                   << "  (max bucket = " << max_bucket_flows << " flows / "
                   << kColsPerRow << " cols)\n";
