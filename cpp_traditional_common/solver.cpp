@@ -208,7 +208,17 @@ SolverResult solve_bucket(
     }
     int rank = gauss_jordan(aug, m, n);
 
-    if (rank == n) {
+    // Exact path is correct only for a SQUARE full-rank system (m == n,
+    // rank == n). With m > n the system is over-determined: in noise-free
+    // conditions the leading n rows give the true solution and the
+    // remaining m - n equations are redundant, but with hidden-flow
+    // contamination of the CMS cells those extra equations make the
+    // system inconsistent. Reading the pivot solution then produces
+    // negative residuals on some flows which to_count() clamps to 0,
+    // grossly inflating the total. For m > n we therefore route through
+    // Algorithm 6 step B, which uses least squares via the normal
+    // equations and distributes the residual properly across all flows.
+    if (rank == n && m == n) {
         // Exact: read solution from the row-reduced augmented matrix.
         for (int r = 0; r < m && r < n; ++r) {
             int pcol = -1;
@@ -229,7 +239,9 @@ SolverResult solve_bucket(
         return out;
     }
 
-    // Step 2: under-determined — Algorithm 6 approximate.
+    // Step 2: under-determined (rank < n) OR over-determined (m > n) —
+    // Algorithm 6 approximate. When rank == n it pins zero vars in
+    // step A and runs least squares in step B on all n flows.
     std::vector<double> x_approx = algorithm6(A, b, m, n, rank);
     for (int j = 0; j < n; ++j) out.cms_estimate[j] = to_count(x_approx[j]);
     out.path  = SolverPath::Algorithm6;
