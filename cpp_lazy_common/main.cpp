@@ -24,10 +24,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include <arpa/inet.h>     // inet_ntoa for CSV IP formatting
 
 #include "bfrt_client.hpp"
 #include "crc.hpp"
@@ -92,6 +95,12 @@ struct Config {
     // cms_2 because of an adjacent "id" field in the bfrt_info JSON).
     std::vector<uint32_t> bf_ids_override;
     std::vector<uint32_t> cms_ids_override;
+    // Test-harness flags. If csv_out is non-empty, after each epoch the
+    // per-flow estimates are appended to that file. If max_epochs > 0 the
+    // CP exits after that many epochs have ended (so the harness can
+    // process one chunk per CP invocation).
+    std::string csv_out;
+    uint32_t    max_epochs = 0;
 };
 
 static std::vector<uint32_t> parse_id_csv(const std::string& s) {
@@ -114,10 +123,13 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--pipe"  && i + 1 < argc) c.pipe_id = std::atoi(argv[++i]);
         else if (a == "--bf-ids"  && i + 1 < argc) c.bf_ids_override  = parse_id_csv(argv[++i]);
         else if (a == "--cms-ids" && i + 1 < argc) c.cms_ids_override = parse_id_csv(argv[++i]);
+        else if (a == "--csv-out" && i + 1 < argc) c.csv_out  = argv[++i];
+        else if (a == "--epochs"  && i + 1 < argc) c.max_epochs = (uint32_t)std::atoi(argv[++i]);
         else if (a == "--help" || a == "-h") {
             std::cout << "usage: " << argv[0]
                       << " [--epoch SECS] [--pipe N]"
-                      << " [--bf-ids id0,id1,id2] [--cms-ids id0,id1,id2]\n";
+                      << " [--bf-ids id0,id1,id2] [--cms-ids id0,id1,id2]"
+                      << " [--csv-out FILE] [--epochs N]\n";
             std::exit(0);
         }
     }
@@ -287,6 +299,12 @@ int main(int argc, char** argv) {
         uint64_t epoch_digests = 0, epoch_packets = 0;
         size_t   alg4_count = 0, alg5_count = 0, solver_input_count = 0;
 
+        // Per-flow estimate + path tag, populated below. Used both for the
+        // summary print and the optional --csv-out dump at the end of the
+        // epoch. Path values: "alg4", "alg5", "exact", "alg6", "min".
+        std::unordered_map<FlowKey, std::pair<uint64_t, const char*>, FlowKeyHash> per_flow;
+        per_flow.reserve(snap.size());
+
         for (const auto& kv : snap) {
             const FlowKey& k = kv.first;
             uint32_t       dc = kv.second;
@@ -303,12 +321,14 @@ int main(int argc, char** argv) {
             if (dc == 1 && bf[1][bf_i1] == 0) {
                 ++alg4_count;
                 epoch_packets += 1;
+                per_flow[k] = {1, "alg4"};
                 continue;
             }
             // Algorithm 4: 2-pkt mouse — bf_0 and bf_1 set, bf_2 still 0.
             if (dc == 2 && bf[2][bf_i2] == 0) {
                 ++alg4_count;
                 epoch_packets += 2;
+                per_flow[k] = {2, "alg4"};
                 continue;
             }
 
@@ -329,6 +349,7 @@ int main(int argc, char** argv) {
                 if (cmin == 0) {
                     ++alg5_count;
                     epoch_packets += 3;
+                    per_flow[k] = {3, "alg5"};
                     continue;
                 }
             }
@@ -376,6 +397,10 @@ int main(int argc, char** argv) {
                 if (r.path == SolverPath::Exact)           ++exact_buckets;
                 else if (r.path == SolverPath::Algorithm6) ++alg6_buckets;
             }
+            const char* path_tag = (r.path == SolverPath::Skipped)    ? "min"
+                                 : (r.path == SolverPath::Exact)      ? "exact"
+                                 : (r.path == SolverPath::Algorithm6) ? "alg6"
+                                 :                                       "min";
             for (size_t j = 0; j < buckets[b].size(); ++j) {
                 uint64_t v;
                 if (r.path == SolverPath::Skipped) {
@@ -389,6 +414,7 @@ int main(int argc, char** argv) {
                 auto it = snap.find(buckets[b][j]);
                 if (it != snap.end()) per_flow_cms[&(it->first)] = v;
                 epoch_packets += it->second + v;
+                per_flow[buckets[b][j]] = {it->second + v, path_tag};
             }
         }
         double max_load = (double)max_bucket_flows / kColsPerRow;
@@ -434,8 +460,45 @@ int main(int argc, char** argv) {
         std::cerr << "  bulk clear time        : "
                   << std::chrono::duration<double>(t3 - t2).count() << " s\n";
 
+        // Optional per-flow CSV dump (for the eval harness). Schema matches
+        // the Python CP so compare.py can ingest either source.
+        if (!cfg.csv_out.empty()) {
+            std::ofstream out(cfg.csv_out);
+            if (!out) {
+                std::cerr << "[main] WARN: cannot open --csv-out file: "
+                          << cfg.csv_out << "\n";
+            } else {
+                out << "src_ip,dst_ip,proto,src_port,dst_port,"
+                       "digest_count,estimated_packets,solver_path\n";
+                char ipbuf_s[INET_ADDRSTRLEN], ipbuf_d[INET_ADDRSTRLEN];
+                for (const auto& kv : snap) {
+                    const FlowKey& k = kv.first;
+                    uint32_t       dc = kv.second;
+                    in_addr a; a.s_addr = htonl(k.src_ip);
+                    inet_ntop(AF_INET, &a, ipbuf_s, sizeof(ipbuf_s));
+                    a.s_addr = htonl(k.dst_ip);
+                    inet_ntop(AF_INET, &a, ipbuf_d, sizeof(ipbuf_d));
+                    auto it = per_flow.find(k);
+                    uint64_t est = it != per_flow.end() ? it->second.first  : (uint64_t)dc;
+                    const char* path = it != per_flow.end() ? it->second.second : "min";
+                    out << ipbuf_s << "," << ipbuf_d << ","
+                        << (unsigned)k.proto << ","
+                        << k.src_port << "," << k.dst_port << ","
+                        << dc << "," << est << "," << path << "\n";
+                }
+                std::cerr << "  CSV out written        : " << cfg.csv_out
+                          << " (" << per_flow.size() << " flows)\n";
+            }
+        }
+
         std::cerr << "========================================================================\n";
         ++epoch_num;
+
+        if (cfg.max_epochs && (epoch_num - 1) >= cfg.max_epochs) {
+            std::cerr << "[main] --epochs " << cfg.max_epochs
+                      << " reached; exiting\n";
+            break;
+        }
     }
 
     std::cerr << "[main] shutting down\n";
