@@ -10,10 +10,10 @@
 //     visible flow generates 1, 2, or 3 digests).
 //   - Every --epoch seconds:
 //       * Bulk-reads the 3 BF + 3 CMS register tables.
-//       * For each visible flow runs Alg 4 (1/2-pkt mice via BF state),
-//         then Alg 5 (3-pkt flows via CMS == 0), then the sub-sketch
-//         equation solver (Exact / Algorithm 6 / min(cms_rows) fallback
-//         when n > kColsPerRow).
+//       * For each visible flow runs Alg 4 (BF negative -> count = dc),
+//         then Alg 5 (BF positive, CMS == 0 -> count = dc), then the
+//         sub-sketch equation solver (Exact / Algorithm 6, both bounded
+//         by min(cms_rows); skipped when n > 3c or n > kSlowSolverCap).
 //       * Prints a one-line summary (flows, digests, est. packets, max load).
 //       * Bulk-clears all 6 register tables.
 
@@ -284,14 +284,17 @@ int main(int argc, char** argv) {
         // probe but spams the terminal at line-rate scale. Re-enable it
         // behind a flag if you ever need to debug index computation again.)
 
-        // Per-flow estimate. Three paths in order of cheapness/precision:
-        //   Algorithm 4: digest_count == 1 AND bf_1[idx1] == 0  -> exactly 1 pkt
-        //                digest_count == 2 AND bf_2[idx2] == 0  -> exactly 2 pkts
-        //   Algorithm 5: digest_count == 3 AND min(cms_rows) == 0 -> exactly 3 pkts
-        //   Else        : fall through to sub-sketch equation solver per bucket
-        //                 (with min(cms_rows) fallback when n > kColsPerRow).
-        // Algs 4/5 don't trust CMS for known-mouse / known-3-pkt flows, so
-        // they're not contaminated by hidden-flow CMS contributions.
+        // Per-flow estimate. Three paths in order of cheapness/precision
+        // (paper Section 3.4):
+        //   Algorithm 4 (BF preprocessing): any BF row is 0 for this flow
+        //                  -> flow never reached CMS, count = digest_count
+        //   Algorithm 5 (CMS preprocessing): all BF rows set, but min(cms)
+        //                  is 0 -> flow contributed nothing to CMS,
+        //                  count = digest_count
+        //   Else        : fall through to sub-sketch equation solver per
+        //                 bucket (exact / Alg6 / min(cms_rows) fallback).
+        // Algs 4/5 are robust to BF false positives at earlier rows
+        // because the BF / CMS query checks the post-epoch state directly.
         std::array<std::vector<FlowKey>, kCmsBuckets>                    buckets;
         std::array<std::vector<std::array<std::pair<int,uint32_t>,3>>, kCmsBuckets> bucket_cells;
         std::array<std::vector<uint64_t>, 3> cms_arr{cms[0], cms[1], cms[2]};
@@ -315,20 +318,16 @@ int main(int argc, char** argv) {
             uint32_t bf_i0 = bf_idx(polys::bf0, bytes);
             uint32_t bf_i1 = bf_idx(polys::bf1, bytes);
             uint32_t bf_i2 = bf_idx(polys::bf2, bytes);
-            (void)bf_i0;  // bf_0 always set for any visible flow; not needed below
 
-            // Algorithm 4: 1-pkt mouse — only bf_0 was set.
-            if (dc == 1 && bf[1][bf_i1] == 0) {
+            // Algorithm 4 (BF preprocessing, paper Section 3.4.1): if any
+            // of the k BF rows is 0 for this flow's hash positions, the
+            // lazy BF guarantees the flow never reached the CMS, so its
+            // true count equals the digest count. Robust to BF false
+            // positives at earlier rows.
+            if (bf[0][bf_i0] == 0 || bf[1][bf_i1] == 0 || bf[2][bf_i2] == 0) {
                 ++alg4_count;
-                epoch_packets += 1;
-                per_flow[k] = {1, "alg4"};
-                continue;
-            }
-            // Algorithm 4: 2-pkt mouse — bf_0 and bf_1 set, bf_2 still 0.
-            if (dc == 2 && bf[2][bf_i2] == 0) {
-                ++alg4_count;
-                epoch_packets += 2;
-                per_flow[k] = {2, "alg4"};
+                epoch_packets += dc;
+                per_flow[k] = {dc, "alg4"};
                 continue;
             }
 
@@ -341,17 +340,19 @@ int main(int argc, char** argv) {
                 {2, off | cms_col(polys::cms2, bytes)},
             }};
 
-            // Algorithm 5: 3-pkt flow — all 3 BF cells set, but no CMS hits.
-            if (dc == 3) {
-                uint64_t cmin = std::min({cms[0][cells[0].second],
-                                           cms[1][cells[1].second],
-                                           cms[2][cells[2].second]});
-                if (cmin == 0) {
-                    ++alg5_count;
-                    epoch_packets += 3;
-                    per_flow[k] = {3, "alg5"};
-                    continue;
-                }
+            // Algorithm 5 (CMS preprocessing, paper Section 3.4.2): all k
+            // BF rows are set for this flow, but if the CMS estimate is
+            // zero across all k rows the flow contributed nothing to the
+            // CMS (its BF bits were set by other flows or by its own
+            // packets in the same epoch). True count equals digest count.
+            uint64_t cmin = std::min({cms[0][cells[0].second],
+                                       cms[1][cells[1].second],
+                                       cms[2][cells[2].second]});
+            if (cmin == 0) {
+                ++alg5_count;
+                epoch_packets += dc;
+                per_flow[k] = {dc, "alg5"};
+                continue;
             }
 
             // Falls through to the equation solver. Stash for the per-bucket
@@ -381,13 +382,12 @@ int main(int argc, char** argv) {
             //
             //   2. n > kSlowSolverCap: solve_bucket() routes m > n through
             //      Algorithm 6 step B (least squares via normal equations).
-            //      Step B's AtA construction is O(n^2 * m) per bucket; at
-            //      n ~ 1000+ that blows out per-epoch runtime to many
-            //      minutes. Cap at 500 so total solver wall-time stays
-            //      under a few seconds. Beyond the cap we fall back to
-            //      min(cms_rows) -- slightly inflated at high load but
-            //      O(1) per flow.
-            constexpr uint32_t kSlowSolverCap = 500;
+            //      Step B's AtA construction is O(n^2 * m) per bucket. The
+            //      cap is set to catch every reasonable bucket under the
+            //      tested CMS geometries (256 buckets: mean ~750-1100, 128
+            //      buckets: mean ~1500) while still skipping outlier
+            //      buckets that get unusually hot from hash skew.
+            constexpr uint32_t kSlowSolverCap = 2000;
             if (buckets[b].size() > 3 * kColsPerRow ||
                 buckets[b].size() > kSlowSolverCap) {
                 r.path = SolverPath::Skipped;
@@ -403,13 +403,17 @@ int main(int argc, char** argv) {
                                  :                                       "min";
             for (size_t j = 0; j < buckets[b].size(); ++j) {
                 uint64_t v;
+                auto& cells = bucket_cells[b][j];
+                uint64_t cms_min = std::min({cms[0][cells[0].second],
+                                             cms[1][cells[1].second],
+                                             cms[2][cells[2].second]});
                 if (r.path == SolverPath::Skipped) {
-                    auto& cells = bucket_cells[b][j];
-                    v = std::min({cms[0][cells[0].second],
-                                  cms[1][cells[1].second],
-                                  cms[2][cells[2].second]});
+                    v = cms_min;
                 } else {
-                    v = r.cms_estimate[j];
+                    // Paper Section 3.4.2: bound the solver output by the
+                    // standard CMS min to cap worst-case error from
+                    // hidden-flow contamination.
+                    v = std::min(r.cms_estimate[j], cms_min);
                 }
                 auto it = snap.find(buckets[b][j]);
                 if (it != snap.end()) per_flow_cms[&(it->first)] = v;
@@ -426,9 +430,9 @@ int main(int argc, char** argv) {
         std::cerr << "  Total flows            : " << total_flows << "\n"
                   << "  Epoch digests          : " << epoch_digests << "\n"
                   << "  Estimated packets      : " << epoch_packets << "\n"
-                  << "  Resolved by Alg4 (1/2-pkt mice) : " << alg4_count
+                  << "  Resolved by Alg4 (BF negative)  : " << alg4_count
                   << "  (" << pct(alg4_count) << "%)\n"
-                  << "  Resolved by Alg5 (3-pkt flows)  : " << alg5_count
+                  << "  Resolved by Alg5 (CMS == 0)     : " << alg5_count
                   << "  (" << pct(alg5_count) << "%)\n"
                   << "  Equation solver / min fallback  : " << solver_input_count
                   << "  (" << pct(solver_input_count) << "%)\n"

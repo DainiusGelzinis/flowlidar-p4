@@ -337,10 +337,11 @@ int main(int argc, char** argv) {
             // Skip criteria, in order:
             //   1. n > 3c: information-theoretic limit; no possible exact solve.
             //   2. n > kSlowSolverCap: Algorithm 6 step B (LSQ via normal
-            //      equations) is O(n^2 * m) per bucket, which blows out
-            //      runtime at large n. Cap at 500 to keep solver wall-time
-            //      under a few seconds. Beyond cap -> min(cms_rows) fallback.
-            constexpr uint32_t kSlowSolverCap = 500;
+            //      equations) is O(n^2 * m) per bucket. Cap at 2000 to
+            //      catch every reasonable bucket under the tested CMS
+            //      geometries while still skipping outlier buckets that
+            //      get unusually hot from hash skew.
+            constexpr uint32_t kSlowSolverCap = 2000;
             if (buckets[b].size() > 3 * kColsPerRow ||
                 buckets[b].size() > kSlowSolverCap) {
                 r.path = SolverPath::Skipped;
@@ -356,13 +357,17 @@ int main(int argc, char** argv) {
                                  :                                       "min";
             for (size_t j = 0; j < buckets[b].size(); ++j) {
                 uint64_t v;
+                auto& cells = bucket_cells[b][j];
+                uint64_t cms_min = std::min({cms[0][cells[0].second],
+                                             cms[1][cells[1].second],
+                                             cms[2][cells[2].second]});
                 if (r.path == SolverPath::Skipped) {
-                    auto& cells = bucket_cells[b][j];
-                    v = std::min({cms[0][cells[0].second],
-                                  cms[1][cells[1].second],
-                                  cms[2][cells[2].second]});
+                    v = cms_min;
                 } else {
-                    v = r.cms_estimate[j];
+                    // Paper Section 3.4.2: bound the solver output by the
+                    // standard CMS min to cap worst-case error from
+                    // hidden-flow contamination.
+                    v = std::min(r.cms_estimate[j], cms_min);
                 }
                 auto it = snap.find(buckets[b][j]);
                 if (it != snap.end()) per_flow_cms[&(it->first)] = v;

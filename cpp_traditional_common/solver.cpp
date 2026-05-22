@@ -208,17 +208,16 @@ SolverResult solve_bucket(
     }
     int rank = gauss_jordan(aug, m, n);
 
-    // Exact path is correct only for a SQUARE full-rank system (m == n,
-    // rank == n). With m > n the system is over-determined: in noise-free
-    // conditions the leading n rows give the true solution and the
-    // remaining m - n equations are redundant, but with hidden-flow
-    // contamination of the CMS cells those extra equations make the
-    // system inconsistent. Reading the pivot solution then produces
-    // negative residuals on some flows which to_count() clamps to 0,
-    // grossly inflating the total. For m > n we therefore route through
-    // Algorithm 6 step B, which uses least squares via the normal
-    // equations and distributes the residual properly across all flows.
-    if (rank == n && m == n) {
+    // Exact path: rank(A) == n means the system has a unique solution.
+    // For m == n the matrix is square and the pivots give it directly.
+    // For m > n the extra equations either reduce to 0 = 0 (consistent,
+    // redundant) or to 0 = residual (inconsistent due to hidden-flow
+    // contamination of the CMS cells). In both cases reading the pivot
+    // rows gives a well-defined value; under contamination it may be
+    // inflated, but main.cpp clamps the per-flow estimate to
+    // min(cms_rows) afterwards, which matches the paper's worst-case
+    // bound (Section 3.4.2).
+    if (rank == n) {
         // Exact: read solution from the row-reduced augmented matrix.
         for (int r = 0; r < m && r < n; ++r) {
             int pcol = -1;
