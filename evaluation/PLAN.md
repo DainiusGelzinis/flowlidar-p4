@@ -87,84 +87,85 @@ T2 is produced by running `pcap_distribution_strict.sh` against each pcap.
 
 ---
 
-### 4.3 Section 6.3 — Lazy vs traditional, consistency across pcaps
+### 4.3 Section 6.3 — Lazy vs traditional BF, swept over BF size [DONE, 1 chunk]
 
-| Goal | Same hardware, same CP, same CMS — only the BF semantics differ. Show lazy consistently beats traditional on coverage and per-flow ARE. |
+| Goal | At fixed CMS, show how lazy vs traditional BF compare across BF sizes. Lazy should sit below traditional on ARE at every operating point, and the gap should narrow only when the BF saturates. |
 | --- | --- |
-| **Variants** | `cpp_lazy_bf1m_cms256x1024` vs `cpp_traditional_bf1m_cms256x1024` |
-| **Pcaps** | All 10 |
-| **Epoch** | 10 s |
-| **Speed** | 2 Gbps (representative line-rate) |
-| **Chunks per pcap** | 5–6 (aggregated to mean ± std) |
-| **Total runs** | 2 variants × 10 pcaps × ~6 chunks = **~120 runs** |
+| **Variants (10)** | Lazy: `cpp_lazy_bf{131k,262k,524k,1m,2m}_cms256x1024` (5)<br>Traditional: `cpp_traditional_bf{131k,262k,524k,1m,2m}_cms256x1024` (5) |
+| **Pcap** | 1 (CAIDA 130000, chunk 0 of 5M packets) |
+| **Epoch** | 20 s (covers replay + bulk read at this load) |
+| **Speed** | 2 Gbps (Click DPDK actual rate ~2.0 Gbps with no per-link drops) |
+| **Chunks per variant** | 1 |
+| **Total runs** | 10 variants × 1 chunk = **10 runs** |
+| **Status** | **DONE** — see `results/6_3/summary_chunk0.csv` (commit 8b86bc8) |
 
 **Output**:
-- **C3** (chart, line, pcaps on x): coverage %, 2 lines (lazy, traditional)
-- **C5** (chart, line, pcaps on x): ARE, 2 lines
+- **C3** (chart, line, BF bits on x [log scale]): coverage %, 2 lines (lazy, traditional)
+- **C5** (chart, line, BF bits on x [log scale]): ARE, 2 lines
+
+**Future (optional, stability):** repeat the 10 runs on chunks 1 and 2 of the same pcap; restart switchd between chunks to dodge the per-epoch register-clear bug in the C++ CP. Adds 20 runs, ~1.5 h of switch time.
 
 ---
 
-### 4.4 Section 6.4.1 — BF size sweep
+### 4.4 Section 6.4 — CMS column sweep at fixed BF=1M, fixed 64 buckets [PENDING, 1 chunk]
 
-| Goal | At fixed CMS (64×1024, the smallest), show how varying BF size affects coverage and per-flow ARE as traffic intensity grows. |
+| Goal | At fixed BF (lazy 1M) and fixed bucket count (64), show how the column count per CMS row drives accuracy. Larger column counts spread flows across more cells, lowering bucket collision pressure on the equation solver. |
 | --- | --- |
-| **Variants** | 5 lazy BF sizes: 131K, 262K, 524K, 1M, 2M (variants #1, #2, #3, #4, #5) |
-| **Pcaps** | 3 representative |
-| **Epoch** | 10 s fixed |
-| **Speed sweep** | 10 Mbps, 100 Mbps, 500 Mbps, 1 Gbps, 2 Gbps, 5 Gbps, 10 Gbps (7 points) |
-| **Runs per point** | 3 (averaged) |
-| **Total runs** | 5 variants × 3 pcaps × 7 speeds × 3 reps = **315 runs** |
+| **Variants (3)** | `cpp_lazy_bf1m_cms64x1024` (built)<br>`cpp_lazy_bf1m_cms64x2048` (needs to be built)<br>`cpp_lazy_bf1m_cms64x4096` (built) |
+| **Pcap** | 1 (CAIDA 130000, chunk 0 of 5M packets — same as 6.3) |
+| **Epoch** | 20 s |
+| **Speed** | 2 Gbps |
+| **Chunks per variant** | 1 |
+| **Total runs** | 3 variants × 1 chunk = **3 runs** |
+| **Status** | **PENDING** |
 
 **Output**:
-- **C6** (chart, line, speed on x): coverage %, 5 lines (one per BF size)
-- **C7** (chart, line, speed on x): ARE, 5 lines
+- **C6** (chart, line, CMS columns on x [log scale]): ARE, 1 line at fixed 64 buckets
+- **C7** (chart, line, CMS columns on x [log scale]): coverage %, 1 line
+- **C8** (chart, line, CMS columns on x [log scale]): per-bucket max load (shows how many flows pile into the worst bucket as columns grow)
+
+**Future (optional, stability):** repeat on chunks 1 and 2. Adds 6 runs.
 
 ---
 
-### 4.5 Section 6.4.2 — CMS shape sweep at constant total CMS cells
+### 4.5 Section 6.5 — CMS bucket sweep at fixed BF=1M, fixed total CMS memory [PENDING, 1 chunk]
 
-| Goal | At fixed BF (1M) and fixed total CMS cells (262K), show whether layout shape (64-bucket vs 128-bucket vs 256-bucket) affects accuracy as traffic intensity grows. |
+| Goal | At fixed BF (lazy 1M) and fixed total CMS cells (~256K), show whether splitting the same memory into more, narrower buckets vs fewer, wider buckets affects accuracy. This isolates the layout/shape effect from the memory-budget effect. |
 | --- | --- |
-| **Variants** | 3 with 1M BF and same total CMS cells: 64×4096, 128×2048, 256×1024 (variants #6, #7, #8) |
-| **Pcaps** | 3 representative |
-| **Epoch** | 10 s fixed |
-| **Speed sweep** | same 7 points |
-| **Runs per point** | 3 |
-| **Total runs** | 3 variants × 3 pcaps × 7 speeds × 3 reps = **189 runs** |
+| **Variants (3)** | `cpp_lazy_bf1m_cms64x4096` (262144 cells, 64 buckets × 4096 cols)<br>`cpp_lazy_bf1m_cms128x2048` (262144 cells, 128 buckets × 2048 cols)<br>`cpp_lazy_bf1m_cms256x1024` (262144 cells, 256 buckets × 1024 cols) |
+| **Pcap** | 1 (CAIDA 130000, chunk 0 of 5M packets) |
+| **Epoch** | 20 s |
+| **Speed** | 2 Gbps |
+| **Chunks per variant** | 1 |
+| **Total runs** | 3 variants × 1 chunk = **3 runs** |
+| **Status** | **PENDING** (cms256x1024 result reusable from 6.3 lazy_bf1m row) |
 
 **Output**:
-- **C8** (chart, line, speed on x): ARE, 3 lines (one per shape)
-- **C9** (chart, line, speed on x): % exact buckets, 3 lines
+- **C9** (chart, line, bucket count on x [log scale]): ARE, 1 line at fixed 256K total cells
+- **C10** (chart, line, bucket count on x [log scale]): coverage %, 1 line
+- **C11** (chart, line, bucket count on x [log scale]): % exact-solved buckets (alg6 + exact), 1 line. Shows when the smaller per-bucket load brings buckets back under the `kSlowSolverCap = 500` ceiling and alg6/exact actually fires.
+
+**Future (optional, stability):** repeat on chunks 1 and 2. Adds 6 runs.
 
 ---
 
-### 4.6 Section 6.4.3 — Stress test (best variant, chunk size sweep)
+### 4.6 Section 6.4.3 — Stress test (best variant, chunk size sweep) [DEFERRED]
 
-| Goal | At the best variant, find the chunk size where sketch accuracy breaks down. |
-| --- | --- |
-| **Variant** | #8 (`cpp_lazy_bf1m_cms256x1024`) |
-| **Pcaps** | All 10 |
-| **Chunk sweep** | 1M, 2M, 5M, 10M, 20M, 30M packets (6 points) — chunks here = different click pkt counts |
-| **Epoch** | Long enough to absorb the chunk + bulk read time |
-| **Total runs** | 1 × 10 × 6 = **60 runs** |
+Originally planned: 1 variant × 10 pcaps × 6 chunk sizes × ~1 chunk = 60 runs.
 
-**Output**:
-- **C10** (chart, line, chunk on x): max sub-sketch load
-- **C11** (chart, line, chunk on x): ARE
-- **C12** (chart, line, chunk on x): coverage %
-  Each has 10 faint per-pcap lines + 1 bold mean line.
+**Status: DEFERRED** until the per-epoch BF/CMS register clear in `cpp_lazy_common/main.cpp` is fixed. Currently each epoch past the first reads residual state from the first run, so chunk-size sweeps reduce to a 1-chunk result.
+
+Workaround if revived: restart switchd between every chunk (slow, ~5 min per data point including reload + setup_table.py).
 
 ---
 
-### 4.7 Section 6.5 — Per-class error breakdown
+### 4.7 Section 6.6 — Per-class error breakdown [REUSE 6.3 DATA]
 
 | Goal | Show how each variant handles different flow size classes (mice vs elephants). |
 | --- | --- |
 | **Variants** | 3: lazy 131k (#1), lazy 1M (#8), traditional 1M (#9) |
-| **Pcap** | 1 representative |
-| **Speed** | 2 Gbps |
-| **Chunks** | 5–6 (aggregated) |
-| **Total runs** | 3 variants × 1 pcap × 6 chunks = **18 runs** |
+| **Pcap** | 1 (CAIDA 130000, chunk 0) |
+| **Source** | Per-class numbers (`AAE_1pkt`, `ARE_1pkt`, ..., `ARE_101plus`) are already in `results/6_3/summary_chunk0.csv` for every variant in 6.3. **No new runs needed**; pure plotting. |
 
 **Output**:
 - **C15** (chart, line, class on x): ARE, 3 lines (one per variant)
@@ -174,7 +175,7 @@ Classes: 1-pkt / 2-pkt / 3-pkt / 4-10 / 11-100 / 101+
 
 ---
 
-### 4.8 Section 6.6 — Resources on Tofino 1
+### 4.8 Section 6.7 — Resources on Tofino 1
 
 No runtime measurements — pull straight from `bf-p4c` compile outputs.
 
@@ -293,23 +294,28 @@ hidden_flows,bf0_sat,bf1_sat,bf2_sat
 
 ---
 
-## 7. Total runs and timing
+## 7. Total runs and timing (revised, 1-chunk strategy)
 
-| Section | Runs |
-|---|---:|
-| 6.2 Python vs C++ | 42 |
-| 6.3 lazy vs traditional | 120 |
-| 6.4.1 BF sweep | 315 |
-| 6.4.2 CMS sweep | 189 |
-| 6.4.3 Stress | 60 |
-| 6.5 Per-class | 18 |
-| **Total** | **~744 runs** |
+| Section | Runs | Status |
+|---|---:|---|
+| 6.2 Python vs C++ | 42 | pending |
+| 6.3 Lazy vs traditional × BF size | 10 | **DONE** |
+| 6.4 CMS column sweep (fixed BF=1M, 64 buckets) | 3 | pending |
+| 6.5 CMS bucket sweep (fixed BF=1M, fixed total memory) | 3 | pending (1 row reusable from 6.3) |
+| 6.4.3 Stress (chunk-size sweep) | 0 | **DEFERRED** (CP bug) |
+| 6.6 Per-class breakdown | 0 | **reuses 6.3 data** |
+| 6.7 Resources (parsed from compile outputs) | 0 | pending |
+| **Total remaining** | **~50 runs** | |
 
-At ~2 min per run with switchd-restart amortized = **~25 hours** of switch
-time. Spread across 2-3 overnight runs is realistic.
+Future-stability budget: 2 additional chunks per variant in 6.3/6.4/6.5 →
++32 runs (16 variants × 2 extra chunks). Each chunk needs switchd
+restart between runs, so budget ~5 min per chunk including reload +
+setup_table.py = ~3 hours of switch time. Optional.
 
-If too many: cut design-space sweeps from 7 speed points to 5 (saves
-~200 runs) and from 3 reps to 2 (saves ~150).
+Most of the remaining 50 runs is 6.2 (Python vs C++, 42 runs across 7
+speed points × 2 CPs × 3 reps). The new CMS sweeps (6.4, 6.5) together
+add only 5 net new runs (cms64x1024, cms64x2048, cms64x4096, cms128x2048,
+plus reuse cms256x1024 from 6.3).
 
 ---
 
@@ -330,12 +336,21 @@ If too many: cut design-space sweeps from 7 speed points to 5 (saves
 
 ---
 
-## 9. Deliverables for the thesis chapter
+## 9. Deliverables for the thesis chapter (revised)
 
-- 8 line charts (C1, C3, C5, C6, C7, C8, C9, C15)
-- 3 stress chart panels (C10, C11, C12)
-- 5 tables (T1 setup, T2 pcaps, T4 per-class, T5 resources, and one
-  pseudo-table T3 if the headline summary belongs in a table rather than
-  prose)
+Charts:
+- **C1** (6.2): Python vs C++ coverage, speed on x
+- **C3, C5** (6.3): lazy vs traditional coverage + ARE, BF bits on x [log]
+- **C6, C7, C8** (6.4): CMS column sweep ARE, coverage, max load, columns on x [log]
+- **C9, C10, C11** (6.5): CMS bucket sweep ARE, coverage, % exact-solved, buckets on x [log]
+- **C15** (6.6): per-class ARE, class on x
 
-Total: **~12 figures, ~5 tables** for the evaluation chapter.
+Tables:
+- **T1** (6.1): variants tested (~16 rows: BF dims, CMS dims, total SRAM, stages, status)
+- **T2** (6.1): pcap characteristics (10 rows: name, packets, flows, mean pkts/flow)
+- **T4** (6.6): per-class flow count + AAE + ARE + % exact per variant
+- **T5** (6.7): per-variant per-stage SRAM blocks + hash units + MAU stages
+
+Total: **~9 figures, 4 tables** for the evaluation chapter. The
+chunk-size stress test (originally C10/C11/C12 in 6.4.3) is deferred
+pending the CP register-clear bug fix.
