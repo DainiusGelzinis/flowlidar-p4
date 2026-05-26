@@ -358,7 +358,7 @@ int main(int argc, char** argv) {
             // min(cms_rows) clamp on solver output ensures alg6 can
             // never do worse than the skip-to-min path even when
             // severely under-determined.
-            constexpr uint32_t kSlowSolverCap = 2000;
+            constexpr uint32_t kSlowSolverCap = 5000;
             if (buckets[b].size() > kSlowSolverCap) {
                 r.path = SolverPath::Skipped;
                 ++skipped_buckets;
