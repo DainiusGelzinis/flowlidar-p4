@@ -18,9 +18,12 @@
 //       * Prints a one-line summary (flows, digests, est. packets, max load).
 //       * Bulk-clears all 6 register tables.
 //
-// Algorithms 4 / 5 are NOT applicable to a traditional BF: every packet
-// flips all 3 BF rows, so a 1-pkt mouse and an N-pkt elephant leave
-// identical BF state. We go straight to the solver / min-fallback path.
+// Algorithm 4 (BF preprocessing) is NOT applicable to a traditional BF:
+// every packet flips all 3 BF rows, so a 1-pkt mouse and an N-pkt elephant
+// leave identical BF state. Algorithm 5 (CMS preprocessing) DOES apply
+// under the §3.3 first-packet-via-digest optimisation: any flow with
+// min(cms_rows) == 0 has count = digest_count. Remaining flows go to the
+// sub-sketch equation solver (Exact / Alg6, bounded by min(cms_rows)).
 
 #include <atomic>
 #include <chrono>
@@ -285,20 +288,22 @@ int main(int argc, char** argv) {
         // probe but spams the terminal at line-rate scale. Re-enable it
         // behind a flag if you ever need to debug index computation again.)
 
-        // Traditional BF: every visible flow goes straight to the sub-sketch
-        // equation solver (with min(cms_rows) fallback when n > kColsPerRow).
-        // Algorithms 4 / 5 are NOT applicable — BF state after the epoch can't
-        // distinguish a 1-pkt mouse from an N-pkt elephant because every
-        // packet flips all 3 BF rows.
+        // Traditional BF: Algorithm 4 (BF preprocessing) does not apply —
+        // every packet flips all 3 BF rows, so BF state cannot distinguish
+        // a 1-pkt mouse from an N-pkt elephant. Algorithm 5 (CMS
+        // preprocessing) DOES apply: under the §3.3 optimisation the first
+        // packet of every flow is counted via the digest and does not
+        // increment the CMS, so any flow with min(cms_rows) == 0 has its
+        // exact count in digest_count.
         std::array<std::vector<FlowKey>, kCmsBuckets>                    buckets;
         std::array<std::vector<std::array<std::pair<int,uint32_t>,3>>, kCmsBuckets> bucket_cells;
         std::array<std::vector<uint64_t>, 3> cms_arr{cms[0], cms[1], cms[2]};
 
         uint64_t epoch_digests = 0, epoch_packets = 0;
-        size_t   solver_input_count = 0;
+        size_t   alg5_count = 0, solver_input_count = 0;
 
-        // Per-flow estimate + path tag (path is one of "exact", "alg6",
-        // "min"; Algs 4/5 never fire on traditional BF).
+        // Per-flow estimate + path tag (path is one of "alg5", "exact",
+        // "alg6", "min"; Alg4 never fires on traditional BF).
         std::unordered_map<FlowKey, std::pair<uint64_t, const char*>, FlowKeyHash> per_flow;
         per_flow.reserve(snap.size());
 
@@ -317,6 +322,18 @@ int main(int argc, char** argv) {
                 {1, off | cms_col(polys::cms1, bytes)},
                 {2, off | cms_col(polys::cms2, bytes)},
             }};
+
+            // Algorithm 5: if the flow contributed nothing to the CMS,
+            // its true count is the digest count.
+            uint64_t cmin = std::min({cms[0][cells[0].second],
+                                       cms[1][cells[1].second],
+                                       cms[2][cells[2].second]});
+            if (cmin == 0) {
+                ++alg5_count;
+                epoch_packets += dc;
+                per_flow[k] = {dc, "alg5"};
+                continue;
+            }
 
             buckets[bucket].push_back(k);
             bucket_cells[bucket].push_back(cells);
@@ -384,6 +401,8 @@ int main(int argc, char** argv) {
         std::cerr << "  Total flows            : " << total_flows << "\n"
                   << "  Epoch digests          : " << epoch_digests << "\n"
                   << "  Estimated packets      : " << epoch_packets << "\n"
+                  << "  Resolved by Alg5 (CMS == 0)     : " << alg5_count
+                  << "  (" << pct(alg5_count) << "%)\n"
                   << "  Equation solver / min fallback  : " << solver_input_count
                   << "  (" << pct(solver_input_count) << "%)\n"
                   << "  Sub-sketch buckets used: " << total_used_buckets
