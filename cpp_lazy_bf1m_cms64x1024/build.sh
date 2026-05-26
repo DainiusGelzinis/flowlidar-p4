@@ -6,8 +6,8 @@
 
 set -euo pipefail
 
-PROGRAM_NAME="lazy_bf1m"
-P4_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lazy_bf1m.p4"
+PROGRAM_NAME="lazy_bf1m_cms64x1024"
+P4_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lazy_bf1m_cms64x1024.p4"
 BUILD_DIR="/tmp/build_${PROGRAM_NAME}"
 
 if [[ -z "${SDE:-}" ]]; then

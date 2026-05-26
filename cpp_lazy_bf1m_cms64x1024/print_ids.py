@@ -20,7 +20,7 @@ for v in ('python3.8', 'python3.10'):
 
 import bfrt_grpc.client as gc
 
-P4_NAME = 'lazy_bf1m'
+P4_NAME = 'lazy_bf1m_cms64x1024'
 
 interface = gc.ClientInterface(
     grpc_addr='localhost:50052',
@@ -43,6 +43,6 @@ for r in ('cms_0', 'cms_1', 'cms_2'):
     cms_ids.append(tid)
 
 print()
-print('Pass these to lazy_bf1m_cp:')
+print('Pass these to lazy_bf1m_cms64x1024_cp:')
 print('  --bf-ids  ' + ','.join(str(i) for i in bf_ids))
 print('  --cms-ids ' + ','.join(str(i) for i in cms_ids))

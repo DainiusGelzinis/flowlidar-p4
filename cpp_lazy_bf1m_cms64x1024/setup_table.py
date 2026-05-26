@@ -5,7 +5,7 @@
 #
 # Run with: bfshell> bfrt_python ~/dainius/hardware_version2/setup_table.py
 
-p4 = bfrt.lazy_bf1m.pipe
+p4 = bfrt.lazy_bf1m_cms64x1024.pipe
 
 # --- Enable ports ---
 bfrt.port.port.add(DEV_PORT=132, SPEED='BF_SPEED_40G',
