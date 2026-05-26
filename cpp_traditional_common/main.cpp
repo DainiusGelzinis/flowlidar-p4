@@ -351,16 +351,15 @@ int main(int argc, char** argv) {
             if (buckets[b].size() > max_bucket_flows) max_bucket_flows = buckets[b].size();
 
             SolverResult r;
-            // Skip criteria, in order:
-            //   1. n > 3c: information-theoretic limit; no possible exact solve.
-            //   2. n > kSlowSolverCap: Algorithm 6 step B (LSQ via normal
-            //      equations) is O(n^2 * m) per bucket. Cap at 2000 to
-            //      catch every reasonable bucket under the tested CMS
-            //      geometries while still skipping outlier buckets that
-            //      get unusually hot from hash skew.
+            // Skip criterion: n > kSlowSolverCap. Algorithm 6 step B is
+            // O(n^2 * m) per bucket; large n blows up per-epoch runtime.
+            // The paper has no information-theoretic rank gate (Section
+            // 3.4.3 runs alg6 on any under-determined bucket); the
+            // min(cms_rows) clamp on solver output ensures alg6 can
+            // never do worse than the skip-to-min path even when
+            // severely under-determined.
             constexpr uint32_t kSlowSolverCap = 2000;
-            if (buckets[b].size() > 3 * kColsPerRow ||
-                buckets[b].size() > kSlowSolverCap) {
+            if (buckets[b].size() > kSlowSolverCap) {
                 r.path = SolverPath::Skipped;
                 ++skipped_buckets;
             } else {

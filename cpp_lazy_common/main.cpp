@@ -373,23 +373,17 @@ int main(int argc, char** argv) {
             if (buckets[b].size() > max_bucket_flows) max_bucket_flows = buckets[b].size();
 
             SolverResult r;
-            // Skip criteria, in order:
-            //
-            //   1. n > 3c: information-theoretic limit. Sub-sketch CMS has
-            //      3 rows of c cols = 3c equations. With n unknowns the
-            //      matrix can't have full rank when n > 3c, so any solver
-            //      output is garbage. Skip directly to min(cms_rows).
-            //
-            //   2. n > kSlowSolverCap: solve_bucket() routes m > n through
-            //      Algorithm 6 step B (least squares via normal equations).
-            //      Step B's AtA construction is O(n^2 * m) per bucket. The
-            //      cap is set to catch every reasonable bucket under the
-            //      tested CMS geometries (256 buckets: mean ~750-1100, 128
-            //      buckets: mean ~1500) while still skipping outlier
-            //      buckets that get unusually hot from hash skew.
+            // Skip criterion: n > kSlowSolverCap. Algorithm 6 step B is
+            // O(n^2 * m) per bucket; large n blows up per-epoch runtime.
+            // The cap catches reasonable buckets under the tested CMS
+            // geometries (256 buckets: mean ~750-1100, 128 buckets: ~1500)
+            // and skips outliers from hash skew. The paper has no
+            // information-theoretic rank gate (Section 3.4.3 runs alg6
+            // on any under-determined bucket); the min(cms_rows) clamp
+            // on solver output ensures alg6 can never do worse than the
+            // skip-to-min path even when severely under-determined.
             constexpr uint32_t kSlowSolverCap = 2000;
-            if (buckets[b].size() > 3 * kColsPerRow ||
-                buckets[b].size() > kSlowSolverCap) {
+            if (buckets[b].size() > kSlowSolverCap) {
                 r.path = SolverPath::Skipped;
                 ++skipped_buckets;
             } else {
