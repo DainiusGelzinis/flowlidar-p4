@@ -3,7 +3,7 @@
 FlowLiDAR is a per-flow packet counting system implemented entirely in the Intel Tofino 1 data plane, with a Python control plane that reconstructs exact counts at epoch boundaries. This guide covers the complete implementation from first principles through all five prototypes.
 
 **Paper:** Monterubbiano et al., "FlowLiDAR: Per-Flow Network Telemetry with Low Processing and Storage", ACM SIGMETRICS 2023.
-**PDF:** `/home/student/Desktop/flowlidar/flowlidar_paper.pdf`
+**PDF:** `docs/flowlidar_paper.pdf`
 
 ---
 
@@ -67,43 +67,75 @@ An epoch is a fixed measurement window (e.g., 10–30 seconds). At epoch start, 
 
 ```
 flowlidar/
-├── common/
-│   ├── headers.p4          # All packet header definitions and typedefs
-│   └── util.p4             # TofinoIngressParser, EmptyEgress stubs, BypassEgress
+├── README.md                      this file
+├── .gitignore
 │
-├── prototype1/             # Build pipeline check + IPv4 LPM forwarding
-│   ├── prototype1.p4
-│   ├── build.sh
-│   ├── setup_table.py      # Adds LPM forwarding entry (bfshell)
+├── docs/                          paper, survey, working notes
+│   ├── flowlidar_paper.pdf
+│   ├── survey.pdf
+│   └── Notes.md
+│
+├── traffic_gen/                   Click DPDK + pcap helpers
+│   ├── simple_pcap_replay.click   main DPDK replay used by every experiment
+│   ├── single_flow.click
+│   ├── synthetic_traffic.click
+│   ├── pcap_distribution.sh
+│   └── pcap_distribution_strict.sh
+│
+├── common/                        shared P4 headers (#include'd by every variant)
+│   ├── headers.p4
+│   └── util.p4
+│
+├── cpp_lazy_common/               shared C++ control-plane code for lazy BF
+│   ├── main.cpp                   epoch loop, dispatcher (alg4/alg5), bucket reduction
+│   ├── solver.cpp                 Gauss-Jordan exact path + Algorithm 6 + LSQR step B
+│   ├── bfrt_client.cpp/.hpp       bfrt-grpc thin client
+│   ├── Makefile.core              shared build rules (variants `include` this)
+│   └── crc.hpp / flow.hpp
+│
+├── cpp_traditional_common/        same set, but for standard BF (no lazy chain)
+│
+├── cpp_<mode>_bf<size>_cms<NxC>/  one directory per (mode, BF size, CMS geometry)
+│   ├── <name>.p4                  data-plane program
+│   ├── Makefile                   wraps cpp_<mode>_common/Makefile.core
+│   ├── build.sh                   bf-p4c data-plane compile on switch
+│   ├── setup_table.py             bfrt_python init script
+│   ├── print_ids.py               prints register table IDs
 │   └── test_packet.py
 │
-├── prototype2/             # Standard Bloom Filter + digest (Algorithm 1, BF only)
-│   ├── prototype2.p4
-│   ├── build.sh / setup_table.py / test_packet.py
-│   ├── control_plane.py    # Digest receiver (no CMS)
-│   └── reset_epoch.py
+├── evaluation/                    plans, runbooks, harness scripts
+│   ├── PLAN.md                    original full-evaluation plan
+│   ├── remaining_experiments.md   tier-ranked list of what's left
+│   ├── runbook_lazy_vs_traditional_bf.md
+│   ├── traffic_load_test/runbook.md
+│   └── harness/
+│       ├── compare.py             join truth × est CSVs, emit per-flow + summary
+│       ├── truth_csv.sh           tshark → per-flow ground truth
+│       └── merge_chunks.py        combine per-chunk estimate CSVs
 │
-├── prototype3/             # BF + Count-Min Sketch (Algorithm 1, complete)
-│   ├── prototype3.p4
-│   ├── build.sh / setup_table.py / test_packet.py / reset_epoch.py
-│   ├── control_plane.py    # Epoch processor: digest + CMS min estimate
-│   └── debug_cms.py        # Debug: raw CMS register dump + Python CRC comparison
+├── results/                       experiment data + figures + plot scripts
+│   ├── lazy_vs_traditional_bf/    5-BF-size sweep on a single 5M chunk
+│   ├── traffic_load_test/         E8 — load sweep (1M to 32M packets)
+│   └── tofino_resources/          T5 — Tofino resource breakdown per variant
 │
-├── prototype4/             # Lazy Updates BF + conditional CMS (Algorithm 2)
-│   ├── prototype4.p4
-│   ├── build.sh / setup_table.py / test_packet.py / reset_epoch.py
-│   └── control_plane.py    # Epoch: digest_count + min(CMS)
-│
-├── prototype5/             # Same data plane as P4 + equation solver (§3.4)
-│   ├── prototype5.p4       # Identical to prototype4.p4
-│   ├── build.sh / setup_table.py / test_packet.py / reset_epoch.py
-│   ├── control_plane.py    # Algorithms 4/5 + Ax=b solver + Algorithm 6
-│   └── debug_bf.py         # Debug: BF register scan + Python CRC comparison
-│
-└── README.md               # This file
+└── archive/                       historical prototypes + superseded results
+    ├── prototype1/..prototype9/   incremental BF/CMS builds (old workflow)
+    ├── hardware_version{1..4}/    early P4 + Python CP designs
+    ├── lazy_vs_traditional_initial_5M/   precursor of lazy_vs_traditional_bf
+    └── old_model_logs/            stale switchd run logs (March)
 ```
 
-### Prototype Progression
+### Active C++ control-plane variants
+
+The `cpp_<mode>_bf<size>_cms<NxC>/` naming encodes:
+
+| Token | Meaning |
+|---|---|
+| `lazy` / `traditional` | Bloom filter mode (Algorithm 2 lazy chain vs Algorithm 1 plain) |
+| `bf131k`..`bf2m` | BF size: bits per row (3 rows always) |
+| `cms64x1024`..`cms256x1024`..`cms64x4096`..`cms128x2048` | Count-Min Sketch geometry (sub-sketches × cols per row, 3 rows always) |
+
+### Historical prototype progression (archive/)
 
 | # | BF Algorithm | CMS | Control Plane |
 |---|-------------|-----|---------------|
