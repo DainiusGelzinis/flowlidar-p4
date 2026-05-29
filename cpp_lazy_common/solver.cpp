@@ -50,6 +50,106 @@ int gauss_jordan(std::vector<double>& aug, int m, int n) {
     return rank;
 }
 
+// LSQR (Paige & Saunders 1982) for the over-determined least-squares
+// problem: minimize ||M · x - b||_2 where M is m_rows x k_cols (row-major).
+// Iterative bidiagonalization-based solver. Each iteration costs two
+// matrix-vector products and a few O(k) vector ops, so total cost is
+// O(iter * m_rows * k_cols) without forming M^T M. Converges in at most
+// rank iterations for well-conditioned systems; typically far fewer.
+//
+// Returns x of size k_cols. Stops at max_iter or when the residual estimate
+// stops changing meaningfully (relative tolerance tol on phi_bar / beta0).
+std::vector<double> lsqr(const std::vector<double>& M, int m_rows, int k_cols,
+                          const std::vector<double>& b,
+                          int max_iter, double tol) {
+    std::vector<double> x(k_cols, 0.0);
+    if (k_cols == 0 || m_rows == 0) return x;
+
+    // Initialize: u = b / ||b||, beta0 = ||b||
+    std::vector<double> u = b;
+    double beta = 0.0;
+    for (double v : u) beta += v * v;
+    beta = std::sqrt(beta);
+    if (beta < 1e-30) return x;            // b is zero -> trivial solution
+    const double beta0 = beta;
+    for (auto& uu : u) uu /= beta;
+
+    // v = M^T * u, alpha = ||v||, v /= alpha
+    std::vector<double> v(k_cols, 0.0);
+    for (int c = 0; c < k_cols; ++c) {
+        double s = 0.0;
+        for (int i = 0; i < m_rows; ++i) s += M[i * k_cols + c] * u[i];
+        v[c] = s;
+    }
+    double alpha = 0.0;
+    for (double a : v) alpha += a * a;
+    alpha = std::sqrt(alpha);
+    if (alpha < 1e-30) return x;
+    for (auto& a : v) a /= alpha;
+
+    std::vector<double> w = v;
+    double phi_bar = beta;
+    double rho_bar = alpha;
+
+    std::vector<double> Mv(m_rows, 0.0);
+    std::vector<double> Mtu(k_cols, 0.0);
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        // Bidiagonalization step:
+        //   u_new = M*v - alpha*u, beta = ||u_new||, u = u_new / beta
+        for (int i = 0; i < m_rows; ++i) {
+            double s = 0.0;
+            for (int c = 0; c < k_cols; ++c) s += M[i * k_cols + c] * v[c];
+            Mv[i] = s;
+        }
+        beta = 0.0;
+        for (int i = 0; i < m_rows; ++i) {
+            u[i] = Mv[i] - alpha * u[i];
+            beta += u[i] * u[i];
+        }
+        beta = std::sqrt(beta);
+        if (beta < 1e-30) break;            // converged
+        for (auto& uu : u) uu /= beta;
+
+        //   v_new = M^T*u - beta*v, alpha = ||v_new||, v = v_new / alpha
+        for (int c = 0; c < k_cols; ++c) {
+            double s = 0.0;
+            for (int i = 0; i < m_rows; ++i) s += M[i * k_cols + c] * u[i];
+            Mtu[c] = s;
+        }
+        alpha = 0.0;
+        for (int c = 0; c < k_cols; ++c) {
+            v[c] = Mtu[c] - beta * v[c];
+            alpha += v[c] * v[c];
+        }
+        alpha = std::sqrt(alpha);
+        if (alpha < 1e-30) break;
+        for (auto& a : v) a /= alpha;
+
+        // Givens rotation to maintain the QR factorisation implicitly
+        double rho = std::sqrt(rho_bar * rho_bar + beta * beta);
+        double cs = rho_bar / rho;
+        double sn = beta / rho;
+        double theta = sn * alpha;
+        rho_bar = -cs * alpha;
+        double phi = cs * phi_bar;
+        phi_bar = sn * phi_bar;
+
+        // x += (phi/rho) * w;  w = v - (theta/rho) * w
+        double phi_over_rho   = phi / rho;
+        double theta_over_rho = theta / rho;
+        for (int c = 0; c < k_cols; ++c) {
+            x[c] += phi_over_rho * w[c];
+            w[c]  = v[c] - theta_over_rho * w[c];
+        }
+
+        // Relative residual estimate: |phi_bar| approximates ||M*x - b||.
+        if (std::fabs(phi_bar) < tol * beta0) break;
+    }
+
+    return x;
+}
+
 // Algorithm 6 from the FlowLiDAR paper.
 //
 // `A` is m x n (row-major), `b` is m. `n_rank` is the rank of A.
@@ -64,9 +164,13 @@ int gauss_jordan(std::vector<double>& aug, int m, int n) {
 //     system can be uniquely solved).
 //
 // Step B (least-squares on the reduced system):
-//     Subtract the fixed columns' contributions from b. Solve the reduced
-//     system A_red · x_sub = b_red via the normal equations
-//     (A_red^T A_red) x_sub = A_red^T b_red, using Gauss-Jordan.
+//     Subtract the fixed columns' contributions from b, then solve the
+//     reduced system A_red * x_sub = b_red via LSQR. LSQR converges to
+//     the same minimum-residual solution as the normal equations
+//     (A_red^T A_red) x_sub = A_red^T b_red, but without forming A^T A
+//     explicitly. This saves O(k^2 * m) on the matrix product and avoids
+//     the O(k^3) dense Gauss-Jordan; typical convergence is in far fewer
+//     than k iterations for well-conditioned reduced systems.
 std::vector<double> algorithm6(const std::vector<double>& A,
                                 const std::vector<double>& b,
                                 int m, int n, int n_rank) {
@@ -118,45 +222,14 @@ std::vector<double> algorithm6(const std::vector<double>& A,
         for (int c = 0; c < k; ++c)
             Ar[i * k + c] = A[i * n + unfixed[c]];
 
-    // Normal equations: AtA = Ar^T Ar  (k x k),  Atb = Ar^T b_red  (k).
-    std::vector<double> AtA((size_t)k * k, 0.0);
-    std::vector<double> Atb(k, 0.0);
-    for (int c1 = 0; c1 < k; ++c1) {
-        for (int c2 = 0; c2 < k; ++c2) {
-            double s = 0.0;
-            for (int i = 0; i < m; ++i) s += Ar[i * k + c1] * Ar[i * k + c2];
-            AtA[c1 * k + c2] = s;
-        }
-        double s = 0.0;
-        for (int i = 0; i < m; ++i) s += Ar[i * k + c1] * b_red[i];
-        Atb[c1] = s;
-    }
+    // Solve the reduced system via LSQR. max_iter capped at the rank bound
+    // min(m, k); the relative-residual stop catches convergence earlier in
+    // practice.
+    const int    lsqr_max_iter = std::min(m, k) + 20;
+    const double lsqr_tol      = 1e-8;
+    std::vector<double> x_sub = lsqr(Ar, m, k, b_red, lsqr_max_iter, lsqr_tol);
 
-    // Solve AtA · x_sub = Atb via Gauss-Jordan on [AtA | Atb].
-    std::vector<double> aug2((size_t)k * (k + 1), 0.0);
-    for (int r = 0; r < k; ++r) {
-        for (int c = 0; c < k; ++c) aug2[r * (k + 1) + c] = AtA[r * k + c];
-        aug2[r * (k + 1) + k] = Atb[r];
-    }
-    int sub_rank = gauss_jordan(aug2, k, k);
-    (void)sub_rank;  // for normal equations on a full-rank reduced system this == k
-
-    // Read x_sub.  Each row's pivot column gives one variable's value.
-    for (int r = 0; r < k; ++r) {
-        for (int c = 0; c < k; ++c) {
-            if (std::fabs(aug2[r * (k + 1) + c] - 1.0) < 1e-9) {
-                bool only_pivot = true;
-                for (int rr = 0; rr < k && only_pivot; ++rr) {
-                    if (rr == r) continue;
-                    if (std::fabs(aug2[rr * (k + 1) + c]) > 1e-9) only_pivot = false;
-                }
-                if (only_pivot) {
-                    x[unfixed[c]] = aug2[r * (k + 1) + k];
-                    break;
-                }
-            }
-        }
-    }
+    for (int c = 0; c < k; ++c) x[unfixed[c]] = x_sub[c];
     return x;
 }
 

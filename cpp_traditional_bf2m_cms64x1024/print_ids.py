@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-print_ids.py — print bfrt table IDs for the 6 lazy_bf register tables.
+print_ids.py — print bfrt table IDs for the 6 traditional_bf register tables.
 Run as a regular Python script (NOT via bfshell). Make sure NO other CP
 (Python or C++) is using client_id 0 when you run this — bind is exclusive.
 
 Usage on the switch:
-    python3 ~/dainius/hardware_version_cpp_lazy_BF/print_ids.py
+    python3 ~/dainius/cpp_traditional_bf2m_cms64x1024/print_ids.py
 """
 
 import os
@@ -20,7 +20,7 @@ for v in ('python3.8', 'python3.10'):
 
 import bfrt_grpc.client as gc
 
-P4_NAME = 'lazy_bf2m_cms64x1024'
+P4_NAME = 'traditional_bf2m_cms64x1024'
 
 interface = gc.ClientInterface(
     grpc_addr='localhost:50052',
@@ -43,6 +43,6 @@ for r in ('cms_0', 'cms_1', 'cms_2'):
     cms_ids.append(tid)
 
 print()
-print('Pass these to lazy_bf2m_cms64x1024_cp:')
+print('Pass these to traditional_bf2m_cms64x1024_cp:')
 print('  --bf-ids  ' + ','.join(str(i) for i in bf_ids))
 print('  --cms-ids ' + ','.join(str(i) for i in cms_ids))

@@ -345,27 +345,31 @@ int main(int argc, char** argv) {
         size_t   total_used_buckets = 0;
         uint64_t max_bucket_flows = 0;
         std::unordered_map<const FlowKey*, uint64_t> per_flow_cms;
+
+        // Stage 1: solve buckets in parallel (paper §3.4.3). See lazy
+        // variant for full notes. No skip criterion — every non-empty
+        // bucket runs through solve_bucket; LSQR's per-bucket cost is
+        // bounded regardless of n.
+        std::vector<SolverResult> bucket_results(kCmsBuckets);
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (size_t b = 0; b < kCmsBuckets; ++b) {
+            if (buckets[b].empty()) continue;
+            bucket_results[b] = solve_bucket(buckets[b], bucket_cells[b], cms_arr);
+        }
+
+        // Stage 2: serial merge.
         for (size_t b = 0; b < kCmsBuckets; ++b) {
             if (buckets[b].empty()) continue;
             ++total_used_buckets;
             if (buckets[b].size() > max_bucket_flows) max_bucket_flows = buckets[b].size();
 
-            SolverResult r;
-            // Skip criterion: n > kSlowSolverCap. Algorithm 6 step B is
-            // O(n^2 * m) per bucket; large n blows up per-epoch runtime.
-            // The paper has no information-theoretic rank gate (Section
-            // 3.4.3 runs alg6 on any under-determined bucket); the
-            // min(cms_rows) clamp on solver output ensures alg6 can
-            // never do worse than the skip-to-min path even when
-            // severely under-determined.
-            constexpr uint32_t kSlowSolverCap = 5000;
-            if (buckets[b].size() > kSlowSolverCap) {
-                r.path = SolverPath::Skipped;
+            const SolverResult& r = bucket_results[b];
+            if (r.path == SolverPath::Skipped) {
                 ++skipped_buckets;
-            } else {
-                r = solve_bucket(buckets[b], bucket_cells[b], cms_arr);
-                if (r.path == SolverPath::Exact)           ++exact_buckets;
-                else if (r.path == SolverPath::Algorithm6) ++alg6_buckets;
+            } else if (r.path == SolverPath::Exact) {
+                ++exact_buckets;
+            } else if (r.path == SolverPath::Algorithm6) {
+                ++alg6_buckets;
             }
             const char* path_tag = (r.path == SolverPath::Skipped)    ? "min"
                                  : (r.path == SolverPath::Exact)      ? "exact"

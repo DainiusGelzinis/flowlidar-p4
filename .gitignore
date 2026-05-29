@@ -46,3 +46,5 @@ test_packets.pcap
 **/traditional_bf2m_cms256x1024_cp
 **/fast_io/fast_io
 **/traditional_bf1m_cms64x1024_cp
+**/lazy_bf2m_cms64x1024_cp
+**/traditional_bf2m_cms64x1024_cp

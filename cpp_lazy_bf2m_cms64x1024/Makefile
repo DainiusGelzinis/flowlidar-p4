@@ -3,6 +3,6 @@
 BF_SIZE     := 2097152
 CMS_BUCKETS := 64
 CMS_COLS    := 1024
-P4_NAME     := lazy_bf2m
-BINARY      := lazy_bf2m_cp
+P4_NAME     := lazy_bf2m_cms64x1024
+BINARY      := lazy_bf2m_cms64x1024_cp
 include ../cpp_lazy_common/Makefile.core

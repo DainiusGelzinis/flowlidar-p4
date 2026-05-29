@@ -69,7 +69,7 @@ GEN_SRCS     := $(GEN_DIR)/bfruntime.pb.cc \
                 $(GEN_DIR)/google/rpc/status.pb.cc
 
 CXX          := g++
-CXXFLAGS     := -std=c++17 -O2 -Wall \
+CXXFLAGS     := -std=c++17 -O2 -Wall -fopenmp \
                 -I$(SDE_INSTALL)/include \
                 -I$(GEN_DIR) \
                 -I$(SRC_DIR) \
@@ -81,7 +81,8 @@ CXXFLAGS     := -std=c++17 -O2 -Wall \
 PKGCONFIG    := PKG_CONFIG_PATH=$(SDE_INSTALL)/lib/pkgconfig pkg-config
 LDFLAGS      := -L$(SDE_INSTALL)/lib \
                 -Wl,-rpath,$(SDE_INSTALL)/lib \
-                -Wl,--copy-dt-needed-entries
+                -Wl,--copy-dt-needed-entries \
+                -fopenmp
 
 GRPC_LIBS    := $(shell $(PKGCONFIG) --libs grpc++ 2>/dev/null)
 ifeq ($(strip $(GRPC_LIBS)),)

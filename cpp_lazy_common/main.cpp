@@ -367,29 +367,39 @@ int main(int argc, char** argv) {
         size_t   total_used_buckets = 0;
         uint64_t max_bucket_flows = 0;
         std::unordered_map<const FlowKey*, uint64_t> per_flow_cms;
+
+        // Stage 1: compute SolverResult per bucket in parallel (paper §3.4.3
+        // explicitly suggests sub-sketch parallelism). Each bucket's solve
+        // is independent: different (A, b), no shared state during the LSQR
+        // iterations. schedule(dynamic) load-balances when bucket sizes
+        // differ. No skip criterion — every non-empty bucket runs through
+        // solve_bucket. With LSQR step B, per-bucket cost is bounded by
+        // max_iter * O(m * k) where k <= m after step A pinning, so the
+        // wallclock per bucket doesn't blow up at large n. The min(cms_rows)
+        // clamp in stage 2 still bounds the per-flow estimate by the paper's
+        // §3.4.2 worst-case guarantee.
+        std::vector<SolverResult> bucket_results(kCmsBuckets);
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (size_t b = 0; b < kCmsBuckets; ++b) {
+            if (buckets[b].empty()) continue;
+            bucket_results[b] = solve_bucket(buckets[b], bucket_cells[b], cms_arr);
+        }
+
+        // Stage 2: serial merge into per_flow / per_flow_cms / counters. Map
+        // inserts aren't thread-safe and would need a critical section anyway;
+        // this stage is fast (just hash-map inserts).
         for (size_t b = 0; b < kCmsBuckets; ++b) {
             if (buckets[b].empty()) continue;
             ++total_used_buckets;
             if (buckets[b].size() > max_bucket_flows) max_bucket_flows = buckets[b].size();
 
-            SolverResult r;
-            // Skip criterion: n > kSlowSolverCap. Algorithm 6 step B is
-            // O(n^2 * m) per bucket; large n blows up per-epoch runtime.
-            // The cap catches reasonable buckets under the tested CMS
-            // geometries (256 buckets: mean ~750-1100, 128 buckets: ~1500)
-            // and skips outliers from hash skew. The paper has no
-            // information-theoretic rank gate (Section 3.4.3 runs alg6
-            // on any under-determined bucket); the min(cms_rows) clamp
-            // on solver output ensures alg6 can never do worse than the
-            // skip-to-min path even when severely under-determined.
-            constexpr uint32_t kSlowSolverCap = 5000;
-            if (buckets[b].size() > kSlowSolverCap) {
-                r.path = SolverPath::Skipped;
+            const SolverResult& r = bucket_results[b];
+            if (r.path == SolverPath::Skipped) {
                 ++skipped_buckets;
-            } else {
-                r = solve_bucket(buckets[b], bucket_cells[b], cms_arr);
-                if (r.path == SolverPath::Exact)           ++exact_buckets;
-                else if (r.path == SolverPath::Algorithm6) ++alg6_buckets;
+            } else if (r.path == SolverPath::Exact) {
+                ++exact_buckets;
+            } else if (r.path == SolverPath::Algorithm6) {
+                ++alg6_buckets;
             }
             const char* path_tag = (r.path == SolverPath::Skipped)    ? "min"
                                  : (r.path == SolverPath::Exact)      ? "exact"
