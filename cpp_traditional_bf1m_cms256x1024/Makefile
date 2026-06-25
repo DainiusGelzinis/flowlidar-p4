@@ -6,3 +6,6 @@ CMS_COLS    := 1024
 P4_NAME     := traditional_bf1m_cms256x1024
 BINARY      := traditional_bf1m_cms256x1024_cp
 include ../cpp_traditional_common/Makefile.core
+
+# Paper Algorithm 1: every packet in the CMS -> estimate = CMS value only.
+CXXFLAGS += -DTRAD_CMS_UNGATED

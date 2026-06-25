@@ -413,30 +413,24 @@ control SwitchIngress(
     }
 
     action do_cms_inc_0() { cms_inc_0.execute(ig_md.cms_idx0); }
-    action nop_cms_0()    {}
     @stage(9) table tbl_cms_0 {
-        key            = { ig_md.b0 : exact; ig_md.b1 : exact; ig_md.b2 : exact; }
-        actions        = { do_cms_inc_0; nop_cms_0; }
-        default_action = nop_cms_0;
-        size           = 8;
+        actions        = { do_cms_inc_0; }
+        default_action = do_cms_inc_0;
+        size           = 1;
     }
 
     action do_cms_inc_1() { cms_inc_1.execute(ig_md.cms_idx1); }
-    action nop_cms_1()    {}
     @stage(10) table tbl_cms_1 {
-        key            = { ig_md.b0 : exact; ig_md.b1 : exact; ig_md.b2 : exact; }
-        actions        = { do_cms_inc_1; nop_cms_1; }
-        default_action = nop_cms_1;
-        size           = 8;
+        actions        = { do_cms_inc_1; }
+        default_action = do_cms_inc_1;
+        size           = 1;
     }
 
     action do_cms_inc_2() { cms_inc_2.execute(ig_md.cms_idx2); }
-    action nop_cms_2()    {}
     @stage(11) table tbl_cms_2 {
-        key            = { ig_md.b0 : exact; ig_md.b1 : exact; ig_md.b2 : exact; }
-        actions        = { do_cms_inc_2; nop_cms_2; }
-        default_action = nop_cms_2;
-        size           = 8;
+        actions        = { do_cms_inc_2; }
+        default_action = do_cms_inc_2;
+        size           = 1;
     }
 
     // =========================================================================

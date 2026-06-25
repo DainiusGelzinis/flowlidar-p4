@@ -26,23 +26,7 @@ print("IPv4 LPM entry added: 0.0.0.0/0 -> port 1/0 (D_P=132) [catch-all]")
 # --- Traditional BF: no conditional bf_1/bf_2 chain to set up ---
 # (all 3 BF tables fire unconditionally via default_action)
 
-# --- Conditional CMS increment tables (sub-sketch CMS, 64*1024) ---
-# Only the 2nd-and-later packets of a flow (b0=b1=b2=1) increment CMS;
-# the 1st packet of a visible flow is accounted for by its digest.
-tbl_cms_0 = p4.SwitchIngress.tbl_cms_0
-tbl_cms_0.clear()
-tbl_cms_0.add_with_do_cms_inc_0(b0=1, b1=1, b2=1)
-print("tbl_cms_0: entry (1,1,1) -> do_cms_inc_0")
-
-tbl_cms_1 = p4.SwitchIngress.tbl_cms_1
-tbl_cms_1.clear()
-tbl_cms_1.add_with_do_cms_inc_1(b0=1, b1=1, b2=1)
-print("tbl_cms_1: entry (1,1,1) -> do_cms_inc_1")
-
-tbl_cms_2 = p4.SwitchIngress.tbl_cms_2
-tbl_cms_2.clear()
-tbl_cms_2.add_with_do_cms_inc_2(b0=1, b1=1, b2=1)
-print("tbl_cms_2: entry (1,1,1) -> do_cms_inc_2")
+# --- Paper Algorithm 1: CMS fires unconditionally (no gate entries) ---
 
 print("")
 print("Setup complete. Run traditional_bf_cp to receive flow digests and CMS reports.")
