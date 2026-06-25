@@ -26,7 +26,9 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -135,6 +137,7 @@ static Config parse_args(int argc, char** argv) {
     }
     return c;
 }
+
 
 // CMS index helpers (mirror Python control_plane.py exactly).
 static uint32_t master_bucket(const std::vector<uint8_t>& bytes) {
@@ -379,11 +382,15 @@ int main(int argc, char** argv) {
         // clamp in stage 2 still bounds the per-flow estimate by the paper's
         // §3.4.2 worst-case guarantee.
         std::vector<SolverResult> bucket_results(kCmsBuckets);
+        auto t_solve0 = std::chrono::steady_clock::now();
         #pragma omp parallel for schedule(dynamic, 1)
         for (size_t b = 0; b < kCmsBuckets; ++b) {
             if (buckets[b].empty()) continue;
             bucket_results[b] = solve_bucket(buckets[b], bucket_cells[b], cms_arr);
         }
+        auto t_solve1 = std::chrono::steady_clock::now();
+        std::cerr << "  solver time (local)  : "
+                  << std::chrono::duration<double>(t_solve1 - t_solve0).count() << " s\n";
 
         // Stage 2: serial merge into per_flow / per_flow_cms / counters. Map
         // inserts aren't thread-safe and would need a critical section anyway;

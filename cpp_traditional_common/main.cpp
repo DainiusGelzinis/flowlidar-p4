@@ -110,7 +110,6 @@ struct Config {
     // CP exits after that many epochs have ended.
     std::string csv_out;
     uint32_t    max_epochs = 0;
-    bool        use_remote_solver = false;
 };
 
 static std::vector<uint32_t> parse_id_csv(const std::string& s) {
@@ -135,114 +134,17 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--cms-ids" && i + 1 < argc) c.cms_ids_override = parse_id_csv(argv[++i]);
         else if (a == "--csv-out" && i + 1 < argc) c.csv_out  = argv[++i];
         else if (a == "--epochs"  && i + 1 < argc) c.max_epochs = (uint32_t)std::atoi(argv[++i]);
-        else if (a == "--use-remote-solver") c.use_remote_solver = true;
         else if (a == "--help" || a == "-h") {
             std::cout << "usage: " << argv[0]
                       << " [--epoch SECS] [--pipe N]"
                       << " [--bf-ids id0,id1,id2] [--cms-ids id0,id1,id2]"
-                      << " [--csv-out FILE] [--epochs N] [--use-remote-solver]\n";
+                      << " [--csv-out FILE] [--epochs N]\n";
             std::exit(0);
         }
     }
     return c;
 }
 
-// Serialize all non-empty buckets to one SSH call on hotpot and collect
-// SolverResults. Returns false on transport or parse failure.
-static bool try_dispatch_remote(
-    const std::array<std::vector<FlowKey>, kCmsBuckets>& buckets,
-    const std::array<std::vector<std::array<std::pair<int,uint32_t>,3>>, kCmsBuckets>& bucket_cells,
-    const std::array<std::vector<uint64_t>, 3>& cms_rows,
-    std::vector<SolverResult>& results)
-{
-    std::ostringstream payload;
-    for (size_t b = 0; b < kCmsBuckets; ++b) {
-        int n = (int)bucket_cells[b].size();
-        if (n == 0) continue;
-
-        payload << "BUCKET " << b << " " << n << "\n";
-        for (const auto& cells : bucket_cells[b]) {
-            for (int k = 0; k < 3; ++k) {
-                payload << cells[k].first << " " << cells[k].second;
-                if (k < 2) payload << " ";
-            }
-            payload << "\n";
-        }
-
-        std::map<std::pair<int,uint32_t>, uint64_t> cell_vals;
-        for (const auto& cells : bucket_cells[b])
-            for (const auto& rc : cells) {
-                auto key = std::make_pair((int)rc.first, rc.second);
-                if (!cell_vals.count(key))
-                    cell_vals[key] = cms_rows[rc.first][rc.second];
-            }
-        payload << "VALUES " << cell_vals.size() << "\n";
-        for (const auto& kv : cell_vals)
-            payload << kv.first.first << " " << kv.first.second
-                    << " " << kv.second << "\n";
-    }
-    payload << "END\n";
-
-    const char* tmp_in = "/tmp/flowlidar_remote_in.txt";
-    {
-        FILE* f = std::fopen(tmp_in, "w");
-        if (!f) {
-            std::cerr << "[remote] cannot open " << tmp_in << "\n";
-            return false;
-        }
-        const std::string s = payload.str();
-        std::fwrite(s.data(), 1, s.size(), f);
-        std::fclose(f);
-    }
-
-    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 "
-                      "dgelzini@hotpot.win.tue.nl "
-                      "python3 /home2/dgelzini/flowlidar/remote_solver.py < ";
-    cmd += tmp_in;
-
-    FILE* proc = popen(cmd.c_str(), "r");
-    if (!proc) {
-        std::cerr << "[remote] popen failed\n";
-        return false;
-    }
-
-    std::string output;
-    char buf[65536];
-    while (std::fgets(buf, sizeof(buf), proc))
-        output += buf;
-    int rc = pclose(proc);
-    if (rc != 0) {
-        std::cerr << "[remote] ssh exited with code " << rc << "\n";
-        return false;
-    }
-
-    std::istringstream iss(output);
-    std::string line;
-    int cur_b = -1;
-    while (std::getline(iss, line)) {
-        std::istringstream ls(line);
-        std::string tok;
-        ls >> tok;
-        if (tok == "BUCKET") {
-            ls >> cur_b;
-        } else if (tok == "PATH" && cur_b >= 0 && cur_b < (int)kCmsBuckets) {
-            std::string path; ls >> path;
-            if      (path == "exact") { results[cur_b].path = SolverPath::Exact;      results[cur_b].exact = true; }
-            else if (path == "alg6")  { results[cur_b].path = SolverPath::Algorithm6; results[cur_b].exact = false; }
-            else                      { results[cur_b].path = SolverPath::Skipped; }
-            std::string est_line;
-            if (std::getline(iss, est_line)) {
-                results[cur_b].cms_estimate.clear();
-                std::istringstream es(est_line);
-                uint64_t v;
-                while (es >> v) results[cur_b].cms_estimate.push_back(v);
-            }
-            while (results[cur_b].cms_estimate.size() < buckets[cur_b].size())
-                results[cur_b].cms_estimate.push_back(0);
-        }
-    }
-    return true;
-}
 
 // CMS index helpers (mirror Python control_plane.py exactly).
 static uint32_t master_bucket(const std::vector<uint8_t>& bytes) {
@@ -453,19 +355,13 @@ int main(int argc, char** argv) {
         // bounded regardless of n.
         std::vector<SolverResult> bucket_results(kCmsBuckets);
         auto t_solve0 = std::chrono::steady_clock::now();
-        bool remote_ok = cfg.use_remote_solver &&
-                         try_dispatch_remote(buckets, bucket_cells, cms_arr, bucket_results);
-        if (!remote_ok) {
-            if (cfg.use_remote_solver)
-                std::cerr << "  [remote] fallback to local solver\n";
-            #pragma omp parallel for schedule(dynamic, 1)
-            for (size_t b = 0; b < kCmsBuckets; ++b) {
-                if (buckets[b].empty()) continue;
-                bucket_results[b] = solve_bucket(buckets[b], bucket_cells[b], cms_arr);
-            }
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (size_t b = 0; b < kCmsBuckets; ++b) {
+            if (buckets[b].empty()) continue;
+            bucket_results[b] = solve_bucket(buckets[b], bucket_cells[b], cms_arr);
         }
         auto t_solve1 = std::chrono::steady_clock::now();
-        std::cerr << "  solver time (" << (remote_ok ? "remote" : "local") << ")  : "
+        std::cerr << "  solver time (local)  : "
                   << std::chrono::duration<double>(t_solve1 - t_solve0).count() << " s\n";
 
         // Stage 2: serial merge.
