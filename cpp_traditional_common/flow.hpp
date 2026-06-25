@@ -37,7 +37,6 @@ struct FlowKey {
 
 struct FlowKeyHash {
     size_t operator()(const FlowKey& f) const noexcept {
-        // FNV-1a over the packed 5-tuple.
         uint64_t h = 1469598103934665603ULL;
         auto mix = [&](const void* p, size_t n) {
             const uint8_t* b = static_cast<const uint8_t*>(p);

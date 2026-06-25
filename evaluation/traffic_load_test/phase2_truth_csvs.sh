@@ -1,22 +1,5 @@
 #!/usr/bin/env bash
 # E8 multi-trace prep — Phase 2: generate per-flow truth CSVs via tshark.
-#
-# Run on hotpot, after phase1_cut_pcaps.sh has produced the legacy
-# pcaps. For each named trace timestamp, processes the 5 cut files in
-# /home2/dgelzini/chunks/<ts>_loads/ through truth_csv.sh.
-#
-# Usage:
-#   ssh dgelzini@hotpot.win.tue.nl
-#   bash phase2_truth_csvs.sh                  # default: 130100 130200
-#   bash phase2_truth_csvs.sh 130100           # one trace
-#
-# Each call is idempotent: existing load_<N>_truth.csv files are
-# skipped. Safe to re-run.
-#
-# Expected wall time: ~30-90 min per trace depending on hotpot's load.
-# tshark is single-threaded; the 16M run dominates (~30 min on a quiet
-# host, longer if other users are saturating CPU). Light loads (1-4M)
-# finish in under a minute each.
 
 set -euo pipefail
 

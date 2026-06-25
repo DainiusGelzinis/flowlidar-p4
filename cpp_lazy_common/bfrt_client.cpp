@@ -10,10 +10,7 @@ BfrtClient::BfrtClient(std::string addr, std::string p4_name,
                        uint32_t device_id, uint32_t client_id, uint32_t pipe_id)
     : addr_{std::move(addr)}, p4_name_{std::move(p4_name)},
       device_id_{device_id}, client_id_{client_id}, pipe_id_{pipe_id} {
-    // Bulk-reads of register tables can exceed gRPC's default 4 MB cap.
-    // For prototype5/6 sizing the bf_0 dump is ~4.4 MB; for larger CMS rows
-    // it climbs to ~10 MB. Bump send + receive limits well past that.
-    constexpr int kMaxMsgBytes = 256 * 1024 * 1024;   // 256 MB headroom
+    constexpr int kMaxMsgBytes = 256 * 1024 * 1024;
     grpc::ChannelArguments args;
     args.SetMaxReceiveMessageSize(kMaxMsgBytes);
     args.SetMaxSendMessageSize(kMaxMsgBytes);
@@ -59,7 +56,6 @@ bool BfrtClient::connect_and_bind() {
     }
     std::cerr << "[bfrt] subscribed (client_id=" << client_id_ << ")\n";
 
-    // BIND
     grpc::ClientContext bind_ctx;
     bind_ctx.AddMetadata("client_id", std::to_string(client_id_));
     bf::SetForwardingPipelineConfigRequest bind_req;
@@ -94,8 +90,6 @@ bool BfrtClient::load_bfrt_info() {
 }
 
 // Tiny ad-hoc JSON scan that pairs each "name" with the next "id".
-// Same caveat as the prototype9 fast_io: register-table names show up as
-// "<...>.f1" because the parser is naive — we look up under both forms.
 bool BfrtClient::parse_table_ids(const std::string& info) {
     size_t pos = 0;
     while ((pos = info.find("\"name\"", pos)) != std::string::npos) {
@@ -130,7 +124,6 @@ bool BfrtClient::resolve_table_id(const std::string& full_name, uint32_t& out_id
     if (full_name.rfind("pipe.", 0) == 0 && try_one(full_name.substr(5))) return true;
     if (try_one(full_name + ".f1")) return true;
     if (full_name.rfind("pipe.", 0) == 0 && try_one(full_name.substr(5) + ".f1")) return true;
-    // Suffix match.
     for (auto& kv : table_id_) {
         if (kv.first.size() >= full_name.size() &&
             kv.first.compare(kv.first.size() - full_name.size(),
@@ -167,7 +160,6 @@ bool BfrtClient::read_register(uint32_t table_id, uint32_t expected_size,
         for (const auto& ent : rsp.entities()) {
             if (!ent.has_table_entry()) continue;
             const auto& te = ent.table_entry();
-            // Cache field ids from the first entry that has them.
             if (fids.key_fid == 0 && te.has_key() && te.key().fields_size() > 0) {
                 fids.key_fid = te.key().fields(0).field_id();
             }
@@ -203,8 +195,6 @@ bool BfrtClient::clear_register_indices(uint32_t table_id,
     uint32_t key_fid  = it->second.key_fid;
     uint32_t data_fid = it->second.data_fid;
 
-    // Batch up to N writes per request (gRPC max message size limits this;
-    // 4096 is comfortable with our 256MB channel limit).
     constexpr size_t kBatch = 4096;
     for (size_t off = 0; off < indices.size(); off += kBatch) {
         size_t end = std::min(off + kBatch, indices.size());
@@ -227,7 +217,6 @@ bool BfrtClient::clear_register_indices(uint32_t table_id,
             auto* tbl = update->mutable_entity()->mutable_table_entry();
             tbl->set_table_id(table_id);
 
-            // Key: $REGISTER_INDEX = idx (big-endian, 4 bytes)
             auto* kf = tbl->mutable_key()->add_fields();
             kf->set_field_id(key_fid);
             std::string keybytes(4, '\0');
@@ -235,7 +224,6 @@ bool BfrtClient::clear_register_indices(uint32_t table_id,
             keybytes[2] = (idx >>  8) & 0xff; keybytes[3] =  idx        & 0xff;
             kf->mutable_exact()->set_value(keybytes);
 
-            // Data: f1 = 0, encoded as `stream` (big-endian, value_bytes long)
             auto* df = tbl->mutable_data()->add_fields();
             df->set_field_id(data_fid);
             std::string val(value_bytes, '\0');
@@ -288,9 +276,6 @@ void BfrtClient::start_digest_stream(std::function<void(const FlowKey&)> cb) {
         while (!stop_digests_.load() && stream_->Read(&rsp)) {
             if (rsp.update_case() != bf::StreamMessageResponse::kDigest) continue;
             const auto& dl = rsp.digest();
-            // dl.data is repeated DataField list per digest entry. The P4
-            // digest layout (lazy_bf.p4) is { src_addr, dst_addr, protocol,
-            // src_port, dst_port } in that order — 5 fields per entry.
             for (const auto& entry : dl.data()) {
                 FlowKey k{};
                 int slot = 0;

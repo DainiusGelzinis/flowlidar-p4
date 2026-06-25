@@ -32,7 +32,6 @@ import time
 import argparse
 from collections import defaultdict
 
-
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("truth")
@@ -43,7 +42,6 @@ def parse_args():
     p.add_argument("--quiet", action="store_true",
                    help="Suppress the human-readable summary print")
     return p.parse_args()
-
 
 def load_truth(path):
     flows = {}
@@ -57,9 +55,8 @@ def load_truth(path):
             flows[key] = int(row[5])
     return flows
 
-
 def load_estimate(path):
-    flows = {}    # key -> (digest_count, estimated_packets, path)
+    flows = {}
     with open(path) as f:
         reader = csv.reader(f)
         header = next(reader)
@@ -70,7 +67,6 @@ def load_estimate(path):
             flows[key] = (int(row[5]), int(row[6]), row[7])
     return flows
 
-
 def size_class(pkts):
     if pkts == 1:    return "1pkt"
     if pkts == 2:    return "2pkt"
@@ -79,11 +75,9 @@ def size_class(pkts):
     if pkts <= 100:  return "11_100"
     return "101plus"
 
-
 def mean(xs):
     if not xs: return 0.0
     return sum(xs) / len(xs)
-
 
 def main():
     args = parse_args()
@@ -98,8 +92,6 @@ def main():
     true_pkts_total = sum(truth.values())
     est_pkts_total  = sum(v[1] for v in est.values())
 
-    # Per-flow error metrics — over flows present in BOTH (the CP's own
-    # estimate vs the true pcap count).
     abs_err   = []
     rel_err   = []
     exacts    = 0
@@ -149,14 +141,12 @@ def main():
         summary[f"AAE_{cls}"] = mean(per_class[cls]["abs"])
         summary[f"ARE_{cls}"] = mean(per_class[cls]["rel"])
 
-    # Layer the --meta tags on top (these go in front in the row).
     meta = {}
     for kv in args.meta:
         if "=" in kv:
             k, v = kv.split("=", 1)
             meta[k] = v
 
-    # Decide column order: meta first, then summary metrics.
     columns = list(meta.keys()) + list(summary.keys())
     row     = {**meta, **summary}
 
@@ -181,7 +171,6 @@ def main():
               f"exact={summary['exact_pct']*100:.1f}%  "
               f"alg6={summary['alg6_pct']*100:.1f}%  "
               f"min={summary['min_pct']*100:.1f}%")
-
 
 if __name__ == "__main__":
     main()

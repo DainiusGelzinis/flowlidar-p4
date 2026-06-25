@@ -38,7 +38,6 @@ import math
 import argparse
 from collections import defaultdict
 
-
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("summary")
@@ -49,7 +48,6 @@ def parse_args():
     p.add_argument("--quiet", action="store_true")
     return p.parse_args()
 
-
 def is_numeric(s):
     if s == "" or s is None:
         return False
@@ -59,17 +57,14 @@ def is_numeric(s):
     except (ValueError, TypeError):
         return False
 
-
 def mean(xs):
     return sum(xs) / len(xs) if xs else 0.0
-
 
 def std(xs):
     if len(xs) < 2:
         return 0.0
     m = mean(xs)
     return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
-
 
 def main():
     args = parse_args()
@@ -87,7 +82,6 @@ def main():
         else:
             out_path = base + "_aggregated.csv"
 
-    # Read all rows
     with open(args.summary) as f:
         reader = csv.DictReader(f)
         rows = list(reader)
@@ -104,8 +98,6 @@ def main():
             print(f"        available: {fieldnames}", file=sys.stderr)
             sys.exit(1)
 
-    # Identify numeric columns (any column that is numeric in at least
-    # one row -- we'll mean/std those, treating missing/blank as skipped).
     numeric_cols = []
     for c in fieldnames:
         if c in group_cols:
@@ -113,13 +105,11 @@ def main():
         if any(is_numeric(r.get(c)) for r in rows):
             numeric_cols.append(c)
 
-    # Bucket rows by group key
     groups = defaultdict(list)
     for r in rows:
         key = tuple(r[c] for c in group_cols)
         groups[key].append(r)
 
-    # Build output rows
     out_cols = list(group_cols) + ["n_chunks"]
     for c in numeric_cols:
         out_cols.append(f"{c}_mean")
@@ -145,7 +135,6 @@ def main():
         print(f"  group cols : {group_cols}")
         print(f"  numeric    : {len(numeric_cols)} columns (mean+std)")
         print(f"  output     : {out_path}")
-        # Show a brief preview
         if len(out_rows) <= 20:
             print()
             preview_cols = group_cols + ["n_chunks"]
@@ -163,7 +152,6 @@ def main():
                     else:
                         vals.append(f"{str(v):>14}")
                 print("    " + "  ".join(vals))
-
 
 if __name__ == "__main__":
     main()

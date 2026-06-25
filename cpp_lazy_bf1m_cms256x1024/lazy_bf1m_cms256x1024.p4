@@ -1,36 +1,4 @@
-/* =============================================================================
- * lazy_bf1m_cms256x1024.p4 — FlowLiDAR Lazy BF (1M cells) + 256-sub-sketch CMS
- *
- * Combines the bigger-BF and more-sub-sketches axes:
- *   BF  : 3 × 1048576 × 1 bit   (bit<20> index, k=3, lazy chain)
- *   CMS : 3 × 262144  × 16 bit  (256 sub-sketches × 1024 cols)
- *
- * Goal: at N≈290 K flows on CAIDA the average bucket is now N/256 ≈ 1130,
- * so many buckets fall under kColsPerRow=1024 and the exact Gauss-Jordan
- * solver finally fires. Same total CMS cells as the 64×2048 variant
- * (262 K) but redistributed across 4× more buckets.
- *
- * Index widths:
- *   - BF register index : bit<20>  (1048576 cells)
- *   - CMS register index: bit<18>  (262144 cells)
- *   - master hash       : bit<18>  with 8-bit bucket id in [17:10]
- *   - col hash          : bit<10>  (1024 cols)
- *
- * Stage allocation (12 ingress MAU stages on Tofino 1):
- *
- *   Stage 0  : tbl_hash0       — BF idx0 (20-bit)
- *   Stage 1  : tbl_hash1       — BF idx1 (20-bit)
- *   Stage 2  : tbl_hash2       — BF idx2 (20-bit)
- *   Stage 3  : tbl_bf0         — always: check-and-set bf_0
- *   Stage 4  : tbl_bf1         — conditional on b0==1
- *   Stage 5  : tbl_bf2         — conditional on b0==1 AND b1==1
- *   Stage 6  : tbl_master_hash — master hash (8-bit bucket id)
- *   Stage 7  : tbl_col_hash_*  — column hashes (3 × 10-bit)
- *   Stage 8  : tbl_cms_idx_*   — CMS indices (3 × 18-bit add)
- *   Stage 9  : tbl_cms_0       — conditional CMS row 0 increment
- *   Stage 10 : tbl_cms_1       — conditional CMS row 1 increment
- *   Stage 11 : tbl_cms_2       — conditional CMS row 2 increment
- * ============================================================================= */
+
 
 #include <core.p4>
 #if __TARGET_TOFINO__ == 3
@@ -56,7 +24,6 @@ struct metadata_t {
     bit<16> src_port;
     bit<16> dst_port;
 
-    // BF hash indices — 20-bit each (1048576 cells per row).
     bit<20> idx0;
     bit<20> idx1;
     bit<20> idx2;
@@ -65,15 +32,12 @@ struct metadata_t {
     bit<1> b1;
     bit<1> b2;
 
-    // Sub-sketch offset — bucket_id << 10, in bits [17:10] of a bit<18>.
     bit<18> sketchlet_offset;
 
-    // Column hashes — bit<10> (1024 cols).
     bit<10> col_hash_0;
     bit<10> col_hash_1;
     bit<10> col_hash_2;
 
-    // CMS indices — 18-bit (262144 cells per row).
     bit<18> cms_idx0;
     bit<18> cms_idx1;
     bit<18> cms_idx2;
@@ -166,10 +130,6 @@ control SwitchIngress(
         inout ingress_intrinsic_metadata_for_deparser_t ig_dprsr_md,
         inout ingress_intrinsic_metadata_for_tm_t ig_tm_md) {
 
-    // =========================================================================
-    // BLOOM FILTER — Lazy Updates, 3 × 1048576 cells (1 Mbit each)
-    // =========================================================================
-
     Register<bit<1>, bit<20>>(1048576) bf_0;
     Register<bit<1>, bit<20>>(1048576) bf_1;
     Register<bit<1>, bit<20>>(1048576) bf_2;
@@ -241,8 +201,6 @@ control SwitchIngress(
     }
 
     // =========================================================================
-    // LAZY BF TABLES
-    // =========================================================================
 
     action run_bf0() {
         ig_md.b0 = bf_check_set_0.execute(ig_md.idx0);
@@ -280,9 +238,6 @@ control SwitchIngress(
     }
 
     // =========================================================================
-    // MASTER HASH — 256 sub-sketches. Hash<bit<18>>; pick upper 8 bits via
-    // & 18w0x3FC00 (bits [17:10] = bucket_id << 10).
-    // =========================================================================
 
     CRCPolynomial<bit<32>>(32w0xF4ACFB13,
                            true, false, false,
@@ -301,11 +256,6 @@ control SwitchIngress(
         default_action = compute_master_offset;
         size           = 1;
     }
-
-    // =========================================================================
-    // COUNT-MIN SKETCH — 256 sub-sketches × 1024 cols × 16-bit per row.
-    // Final index = master_hash :: col_hash  (8 high bits :: 10 low bits)
-    // =========================================================================
 
     Register<bit<16>, bit<18>>(262144) cms_0;
     Register<bit<16>, bit<18>>(262144) cms_1;

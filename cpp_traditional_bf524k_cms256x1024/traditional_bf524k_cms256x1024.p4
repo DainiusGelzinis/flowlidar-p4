@@ -1,39 +1,4 @@
-/* =============================================================================
- * traditional_bf.p4 — FlowLiDAR Traditional BF (C++ CP variant)
- *
- * Same data plane shape as cpp_lazy_bf131k_cms64x1024/lazy_bf.p4 EXCEPT:
- *   - All 3 BF rows are checked-and-set unconditionally on every packet
- *     (no lazy chain — bf_1/bf_2 do not gate on b0/b1).
- *   - A digest is sent if ANY of the 3 bits was 0 before this packet, so each
- *     visible flow generates exactly ONE digest in the epoch.
- *   - CMS row increments are still gated on (b0=1 && b1=1 && b2=1), i.e. only
- *     fire for the 2nd-and-later packets of a flow (digest accounts for the
- *     1st packet). Identical to the lazy variant on the CMS side.
- *
- * Because every packet flips all 3 BF bits, BF state at the end of the epoch
- * is the union of every flow that's ever appeared — Algorithms 4/5 cannot run
- * (a 1-pkt mouse and an N-pkt elephant produce identical BF state). The C++
- * control plane skips Algs 4/5 in this variant and goes directly to the
- * solver / min-fallback path.
- *
- * BF:  3 × 524288 × 1 bit  (17-bit indexing, prototype5/6 size)
- * CMS: 3 × 262144 × 16 bit (64 sub-sketches × 1024 cols)
- *
- * Stage allocation (12 ingress MAU stages on Tofino 1):
- *
- *   Stage 0  : tbl_hash0       — BF idx0 (17-bit, CRC-32)
- *   Stage 1  : tbl_hash1       — BF idx1 (17-bit, CRC-32/BZIP2)
- *   Stage 2  : tbl_hash2       — BF idx2 (17-bit, CRC-32C)
- *   Stage 3  : tbl_bf0         — always: check-and-set bf_0
- *   Stage 4  : tbl_bf1         — always: check-and-set bf_1
- *   Stage 5  : tbl_bf2         — always: check-and-set bf_2
- *   Stage 6  : tbl_master_hash — master hash (6-bit, sub-sketch id)
- *   Stage 7  : tbl_col_hash_*  — column hashes (3 × 10-bit)
- *   Stage 8  : tbl_cms_idx_*   — CMS indices (3 × 16-bit add)
- *   Stage 9  : tbl_cms_0       — conditional CMS row 0 increment
- *   Stage 10 : tbl_cms_1       — conditional CMS row 1 increment
- *   Stage 11 : tbl_cms_2       — conditional CMS row 2 increment
- * ============================================================================= */
+
 
 #include <core.p4>
 #if __TARGET_TOFINO__ == 3
@@ -48,8 +13,6 @@
 #include "../common/util.p4"
 
 // ---------------------------------------------------------------------------
-// Digest struct — 5-tuple sent to control plane for each new flow
-// ---------------------------------------------------------------------------
 struct flow_digest_t {
     bit<32> src_addr;
     bit<32> dst_addr;
@@ -58,8 +21,6 @@ struct flow_digest_t {
     bit<16> dst_port;
 }
 
-// ---------------------------------------------------------------------------
-// Metadata
 // ---------------------------------------------------------------------------
 struct metadata_t {
     bit<16> src_port;
@@ -84,8 +45,6 @@ struct metadata_t {
     bit<18> cms_idx2;
 }
 
-// ---------------------------------------------------------------------------
-// Ingress Parser
 // ---------------------------------------------------------------------------
 parser SwitchIngressParser(
         packet_in pkt,
@@ -129,8 +88,6 @@ parser SwitchIngressParser(
 }
 
 // ---------------------------------------------------------------------------
-// Ingress Deparser
-// ---------------------------------------------------------------------------
 control SwitchIngressDeparser(
         packet_out pkt,
         inout header_t hdr,
@@ -170,8 +127,6 @@ control SwitchIngressDeparser(
 }
 
 // ---------------------------------------------------------------------------
-// Ingress Control
-// ---------------------------------------------------------------------------
 control SwitchIngress(
         inout header_t hdr,
         inout metadata_t ig_md,
@@ -179,10 +134,6 @@ control SwitchIngress(
         in    ingress_intrinsic_metadata_from_parser_t ig_prsr_md,
         inout ingress_intrinsic_metadata_for_deparser_t ig_dprsr_md,
         inout ingress_intrinsic_metadata_for_tm_t ig_tm_md) {
-
-    // =========================================================================
-    // BLOOM FILTER — Traditional check-and-set on every packet
-    // =========================================================================
 
     Register<bit<1>, bit<19>>(524288) bf_0;
     Register<bit<1>, bit<19>>(524288) bf_1;
@@ -208,7 +159,6 @@ control SwitchIngress(
     };
 
     // BF hash polynomials — identical to the lazy variant so per-flow CRCs
-    // match crcmod/C++ bf0/bf1/bf2.
     CRCPolynomial<bit<32>>(32w0x04C11DB7,
                            true, false, false,
                            32w0xFFFFFFFF, 32w0xFFFFFFFF) poly0;
@@ -257,8 +207,6 @@ control SwitchIngress(
     }
 
     // =========================================================================
-    // TRADITIONAL BF TABLES — every packet runs check-and-set on all 3 rows
-    // =========================================================================
 
     action run_bf0() {
         ig_md.b0 = bf_check_set_0.execute(ig_md.idx0);
@@ -288,8 +236,6 @@ control SwitchIngress(
     }
 
     // =========================================================================
-    // MASTER HASH — selects which of 64 sub-sketches this flow belongs to
-    // =========================================================================
 
     CRCPolynomial<bit<32>>(32w0xF4ACFB13,
                            true, false, false,
@@ -308,10 +254,6 @@ control SwitchIngress(
         default_action = compute_master_offset;
         size           = 1;
     }
-
-    // =========================================================================
-    // COUNT-MIN SKETCH — sub-sketch partitioned (64 × 1024 cells per row)
-    // =========================================================================
 
     Register<bit<16>, bit<18>>(262144) cms_0;
     Register<bit<16>, bit<18>>(262144) cms_1;
@@ -434,8 +376,6 @@ control SwitchIngress(
     }
 
     // =========================================================================
-    // IPv4 LPM forwarding table
-    // =========================================================================
 
     action hit(PortId_t dst_port) {
         ig_tm_md.ucast_egress_port = dst_port;
@@ -454,8 +394,6 @@ control SwitchIngress(
         default_action = miss();
     }
 
-    // =========================================================================
-    // Apply
     // =========================================================================
     apply {
         ig_md.src_port = 0;
@@ -503,9 +441,6 @@ control SwitchIngress(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Top-level pipeline
-// ---------------------------------------------------------------------------
 Pipeline(
     SwitchIngressParser(),
     SwitchIngress(),

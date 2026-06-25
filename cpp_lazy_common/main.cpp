@@ -1,21 +1,4 @@
 // main.cpp — shared lazy-BF control plane for the cpp_lazy_bf*_cms64x1024
-// variants. The including Makefile (cpp_lazy_common/Makefile.core) injects
-// LAZY_BF_SIZE and LAZY_P4_NAME at compile time so the same source builds
-// against any (BF size, P4 program name) pair.
-//
-// What it does:
-//   - Connects to bfrt-grpc on localhost:50052
-//   - Subscribes + binds to the P4 program named by LAZY_P4_NAME
-//   - Reads digests off the StreamChannel into a flow_table (lazy BF: each
-//     visible flow generates 1, 2, or 3 digests).
-//   - Every --epoch seconds:
-//       * Bulk-reads the 3 BF + 3 CMS register tables.
-//       * For each visible flow runs Alg 4 (BF negative -> count = dc),
-//         then Alg 5 (BF positive, CMS == 0 -> count = dc), then the
-//         sub-sketch equation solver (Exact / Algorithm 6, both bounded
-//         by min(cms_rows); skipped when n > 3c or n > kSlowSolverCap).
-//       * Prints a one-line summary (flows, digests, est. packets, max load).
-//       * Bulk-clears all 6 register tables.
 
 #include <atomic>
 #include <chrono>
@@ -32,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include <arpa/inet.h>     // inet_ntoa for CSV IP formatting
+#include <arpa/inet.h>
 
 #include "bfrt_client.hpp"
 #include "crc.hpp"
@@ -65,12 +48,12 @@ static constexpr const char* kP4Name    = LAZY_P4_NAME;
 static constexpr uint32_t    kDeviceId  = 0;
 static constexpr uint32_t    kClientId  = 0;
 
-static constexpr uint32_t    kBfSize      = LAZY_BF_SIZE;       // per-row BF cells
-static constexpr uint32_t    kCmsBuckets  = LAZY_CMS_BUCKETS;   // sub-sketch count
-static constexpr uint32_t    kColsPerRow  = LAZY_CMS_COLS;      // cols per sub-sketch
+static constexpr uint32_t    kBfSize      = LAZY_BF_SIZE;
+static constexpr uint32_t    kCmsBuckets  = LAZY_CMS_BUCKETS;
+static constexpr uint32_t    kColsPerRow  = LAZY_CMS_COLS;
 static constexpr uint32_t    kCmsSize     = kCmsBuckets * kColsPerRow;
 static constexpr uint32_t    kBucketShift = ilog2_pow2(kColsPerRow);
-static constexpr uint32_t    kCmsIndexMask = kCmsSize - 1;      // assumes power of 2
+static constexpr uint32_t    kCmsIndexMask = kCmsSize - 1;
 
 static_assert((kColsPerRow & (kColsPerRow - 1)) == 0, "LAZY_CMS_COLS must be a power of 2");
 static_assert((kCmsBuckets & (kCmsBuckets - 1)) == 0, "LAZY_CMS_BUCKETS must be a power of 2");
@@ -91,16 +74,9 @@ static void on_sigint(int) { g_quit.store(true); }
 
 struct Config {
     double   epoch_seconds = 30.0;
-    uint32_t pipe_id       = 1;        // p4switch2 default
-    // Optional explicit overrides — comma-separated 3-ids each. If unset
-    // we resolve via the JSON parser in BfrtClient (which sometimes misses
-    // cms_2 because of an adjacent "id" field in the bfrt_info JSON).
+    uint32_t pipe_id       = 1;
     std::vector<uint32_t> bf_ids_override;
     std::vector<uint32_t> cms_ids_override;
-    // Test-harness flags. If csv_out is non-empty, after each epoch the
-    // per-flow estimates are appended to that file. If max_epochs > 0 the
-    // CP exits after that many epochs have ended (so the harness can
-    // process one chunk per CP invocation).
     std::string csv_out;
     uint32_t    max_epochs = 0;
 };
@@ -138,14 +114,11 @@ static Config parse_args(int argc, char** argv) {
     return c;
 }
 
-
 // CMS index helpers (mirror Python control_plane.py exactly).
 static uint32_t master_bucket(const std::vector<uint8_t>& bytes) {
-    // Mirrors the P4 master hash: Hash<bit<log2(kCmsSize)>> truncated, then
-    // upper log2(kCmsBuckets) bits picked as the bucket id.
     uint32_t h32 = polys::master.compute(bytes.data(), bytes.size());
-    uint32_t h   = h32 & kCmsIndexMask;     // truncate to CMS index width
-    return h >> kBucketShift;               // upper log2(kCmsBuckets) bits
+    uint32_t h   = h32 & kCmsIndexMask;
+    return h >> kBucketShift;
 }
 static uint32_t bf_idx(const Crc32& fn, const std::vector<uint8_t>& bytes) {
     return fn.compute(bytes.data(), bytes.size()) & (kBfSize - 1);
@@ -155,12 +128,6 @@ static uint32_t cms_col(const Crc32& fn, const std::vector<uint8_t>& bytes) {
 }
 
 int main(int argc, char** argv) {
-    // Self-test mode: compute CRC of "123456789" for every config and print
-    // hex output. Standard CRC test vectors say (from RevEng catalog):
-    //   CRC-32       (poly 0x04C11DB7, refl, init=FFFF.., xor=FFFF..) -> 0xCBF43926
-    //   CRC-32/BZIP2 (poly 0x04C11DB7, !refl, init=FFFF.., xor=FFFF..) -> 0xFC891918
-    //   CRC-32C      (poly 0x1EDC6F41, refl, init=FFFF.., xor=FFFF..) -> 0xE3069283
-    //   CRC-32D      (poly 0xA833982B, refl, init=FFFF.., xor=FFFF..) -> 0x87315576
     if (argc >= 2 && std::string(argv[1]) == "--selftest") {
         const char* s = "123456789";
         std::vector<uint8_t> b(s, s + 9);
@@ -238,8 +205,6 @@ int main(int argc, char** argv) {
     while (!g_quit.load()) {
         std::this_thread::sleep_for(epoch_dur);
 
-        // Snapshot (and detach) the current flow_table so digest collection
-        // continues into the next epoch's table while we process this one.
         FlowTable snap;
         {
             std::lock_guard<std::mutex> lk(flow_mu);
@@ -269,7 +234,6 @@ int main(int argc, char** argv) {
         double read_secs = std::chrono::duration<double>(t1 - t0).count();
         std::cerr << "  bulk read time         : " << read_secs << " s\n";
 
-        // Diagnostic: how many cells are non-zero per row, and what's the sum?
         for (size_t i = 0; i < 3; ++i) {
             uint64_t sum = 0, nz = 0;
             for (auto v : bf[i])  { if (v) { sum += v; ++nz; } }
@@ -283,21 +247,6 @@ int main(int argc, char** argv) {
                       << " non-zero cells, sum=" << sum << "\n";
         }
 
-        // (Per-flow CRC/index diagnostic removed — was useful for the 6-flow
-        // probe but spams the terminal at line-rate scale. Re-enable it
-        // behind a flag if you ever need to debug index computation again.)
-
-        // Per-flow estimate. Three paths in order of cheapness/precision
-        // (paper Section 3.4):
-        //   Algorithm 4 (BF preprocessing): any BF row is 0 for this flow
-        //                  -> flow never reached CMS, count = digest_count
-        //   Algorithm 5 (CMS preprocessing): all BF rows set, but min(cms)
-        //                  is 0 -> flow contributed nothing to CMS,
-        //                  count = digest_count
-        //   Else        : fall through to sub-sketch equation solver per
-        //                 bucket (exact / Alg6 / min(cms_rows) fallback).
-        // Algs 4/5 are robust to BF false positives at earlier rows
-        // because the BF / CMS query checks the post-epoch state directly.
         std::array<std::vector<FlowKey>, kCmsBuckets>                    buckets;
         std::array<std::vector<std::array<std::pair<int,uint32_t>,3>>, kCmsBuckets> bucket_cells;
         std::array<std::vector<uint64_t>, 3> cms_arr{cms[0], cms[1], cms[2]};
@@ -305,9 +254,6 @@ int main(int argc, char** argv) {
         uint64_t epoch_digests = 0, epoch_packets = 0;
         size_t   alg4_count = 0, alg5_count = 0, solver_input_count = 0;
 
-        // Per-flow estimate + path tag, populated below. Used both for the
-        // summary print and the optional --csv-out dump at the end of the
-        // epoch. Path values: "alg4", "alg5", "exact", "alg6", "min".
         std::unordered_map<FlowKey, std::pair<uint64_t, const char*>, FlowKeyHash> per_flow;
         per_flow.reserve(snap.size());
 
@@ -322,11 +268,6 @@ int main(int argc, char** argv) {
             uint32_t bf_i1 = bf_idx(polys::bf1, bytes);
             uint32_t bf_i2 = bf_idx(polys::bf2, bytes);
 
-            // Algorithm 4 (BF preprocessing, paper Section 3.4.1): if any
-            // of the k BF rows is 0 for this flow's hash positions, the
-            // lazy BF guarantees the flow never reached the CMS, so its
-            // true count equals the digest count. Robust to BF false
-            // positives at earlier rows.
             if (bf[0][bf_i0] == 0 || bf[1][bf_i1] == 0 || bf[2][bf_i2] == 0) {
                 ++alg4_count;
                 epoch_packets += dc;
@@ -334,7 +275,6 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            // Compute CMS indices once for the remaining checks.
             uint32_t bucket = master_bucket(bytes);
             uint32_t off    = bucket << kBucketShift;
             std::array<std::pair<int,uint32_t>,3> cells = {{
@@ -343,11 +283,6 @@ int main(int argc, char** argv) {
                 {2, off | cms_col(polys::cms2, bytes)},
             }};
 
-            // Algorithm 5 (CMS preprocessing, paper Section 3.4.2): all k
-            // BF rows are set for this flow, but if the CMS estimate is
-            // zero across all k rows the flow contributed nothing to the
-            // CMS (its BF bits were set by other flows or by its own
-            // packets in the same epoch). True count equals digest count.
             uint64_t cmin = std::min({cms[0][cells[0].second],
                                        cms[1][cells[1].second],
                                        cms[2][cells[2].second]});
@@ -358,29 +293,16 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            // Falls through to the equation solver. Stash for the per-bucket
-            // pass below.
             buckets[bucket].push_back(k);
             bucket_cells[bucket].push_back(cells);
             ++solver_input_count;
         }
 
-        // Sub-sketch equation solver on the remaining flows.
         size_t   exact_buckets = 0, alg6_buckets = 0, skipped_buckets = 0;
         size_t   total_used_buckets = 0;
         uint64_t max_bucket_flows = 0;
         std::unordered_map<const FlowKey*, uint64_t> per_flow_cms;
 
-        // Stage 1: compute SolverResult per bucket in parallel (paper §3.4.3
-        // explicitly suggests sub-sketch parallelism). Each bucket's solve
-        // is independent: different (A, b), no shared state during the LSQR
-        // iterations. schedule(dynamic) load-balances when bucket sizes
-        // differ. No skip criterion — every non-empty bucket runs through
-        // solve_bucket. With LSQR step B, per-bucket cost is bounded by
-        // max_iter * O(m * k) where k <= m after step A pinning, so the
-        // wallclock per bucket doesn't blow up at large n. The min(cms_rows)
-        // clamp in stage 2 still bounds the per-flow estimate by the paper's
-        // §3.4.2 worst-case guarantee.
         std::vector<SolverResult> bucket_results(kCmsBuckets);
         auto t_solve0 = std::chrono::steady_clock::now();
         #pragma omp parallel for schedule(dynamic, 1)
@@ -392,9 +314,6 @@ int main(int argc, char** argv) {
         std::cerr << "  solver time (local)  : "
                   << std::chrono::duration<double>(t_solve1 - t_solve0).count() << " s\n";
 
-        // Stage 2: serial merge into per_flow / per_flow_cms / counters. Map
-        // inserts aren't thread-safe and would need a critical section anyway;
-        // this stage is fast (just hash-map inserts).
         for (size_t b = 0; b < kCmsBuckets; ++b) {
             if (buckets[b].empty()) continue;
             ++total_used_buckets;
@@ -421,9 +340,6 @@ int main(int argc, char** argv) {
                 if (r.path == SolverPath::Skipped) {
                     v = cms_min;
                 } else {
-                    // Paper Section 3.4.2: bound the solver output by the
-                    // standard CMS min to cap worst-case error from
-                    // hidden-flow contamination.
                     v = std::min(r.cms_estimate[j], cms_min);
                 }
                 auto it = snap.find(buckets[b][j]);
@@ -475,8 +391,6 @@ int main(int argc, char** argv) {
         std::cerr << "  bulk clear time        : "
                   << std::chrono::duration<double>(t3 - t2).count() << " s\n";
 
-        // Optional per-flow CSV dump (for the eval harness). Schema matches
-        // the Python CP so compare.py can ingest either source.
         if (!cfg.csv_out.empty()) {
             std::ofstream out(cfg.csv_out);
             if (!out) {

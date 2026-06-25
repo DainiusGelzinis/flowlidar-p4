@@ -1,25 +1,5 @@
 #!/usr/bin/env bash
 # split_pcaps.sh — pre-split CAIDA pcaps into N-million-packet chunks.
-#
-# Usage:
-#   split_pcaps.sh CHUNK_SIZE_M [PCAP_DIR] [OUTPUT_DIR]
-#
-# Examples:
-#   split_pcaps.sh 5             # 5M-packet chunks, defaults for dirs
-#   split_pcaps.sh 1 /data /out  # 1M-pkt chunks, custom paths
-#
-# Produces, for each pcap, a sibling directory of chunk files:
-#   OUTPUT_DIR/
-#   ├── 125910_chunk5M/
-#   │   ├── chunk_00000_<time>.pcap   (first 5M pkts)
-#   │   ├── chunk_00001_<time>.pcap   (next 5M pkts)
-#   │   └── ...
-#   └── ...
-#
-# Idempotent: if an output dir already has chunk files, that pcap is
-# skipped. Delete the dir manually to force re-split.
-#
-# Requires: editcap (from wireshark-common).
 
 set -euo pipefail
 
@@ -61,7 +41,6 @@ for pcap in "$PCAP_DIR"/*.pcap; do
     total_in=$((total_in + 1))
 
     base=$(basename "$pcap" .pcap)
-    # equinix-nyc.dirA.20190117-130000.UTC.anon -> 130000
     short=$(echo "$base" \
         | sed -E 's/^equinix-nyc\.dir[A-Z]\.[0-9]+-//;
                   s/\.UTC\.anon$//;
@@ -78,8 +57,6 @@ for pcap in "$PCAP_DIR"/*.pcap; do
     echo "[split] $base"
     echo "        -> $out"
 
-    # editcap -c N input output  →  writes output_00000_*.pcap,
-    # output_00001_*.pcap, ... each with N packets (last may be shorter).
     editcap -c "$CHUNK_PKTS" "$pcap" "$out/chunk.pcap" 2>/dev/null
 
     n=$(ls "$out"/chunk_*.pcap 2>/dev/null | wc -l)

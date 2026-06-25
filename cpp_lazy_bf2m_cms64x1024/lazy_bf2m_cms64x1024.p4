@@ -1,28 +1,4 @@
-/* =============================================================================
- * lazy_bf.p4 — FlowLiDAR Lazy BF (C++ CP variant)
- *
- * Adds the paper's master-hash sub-sketch (sketchlet) partitioning to the CMS.
- * Each flow is mapped to one of 64 sub-sketches by a master hash; within that
- * sub-sketch it indexes 1024 columns. Total CMS capacity per row: 64 × 1024 =
- * 65536 cells. Solver runs 64 small independent systems instead of one big one.
- *
- * BF unchanged from prototype5 (3 arrays × 2097152 × 1 bit, lazy updates).
- *
- * Stage allocation (12 ingress MAU stages on Tofino 1):
- *
- *   Stage 0  : tbl_hash0      — BF idx0 (17-bit, CRC32)         [unchanged]
- *   Stage 1  : tbl_hash1      — BF idx1 (17-bit, CRC32/BZIP2)    [unchanged]
- *   Stage 2  : tbl_hash2      — BF idx2 (17-bit, CRC32C)         [unchanged]
- *   Stage 3  : tbl_bf0        — always: check-and-set bf_0       [unchanged]
- *   Stage 4  : tbl_bf1        — conditional on b0==1             [unchanged]
- *   Stage 5  : tbl_bf2        — conditional on b0==1 AND b1==1   [unchanged]
- *   Stage 6  : tbl_master_hash — master hash (6-bit, sub-sketch id)
- *   Stage 7  : tbl_cms_hash   — col hashes + bit-concat to 16-bit indices
- *   Stage 8  : tbl_cms_0      — conditional CMS row 0 increment
- *   Stage 9  : tbl_cms_1      — conditional CMS row 1 increment
- *   Stage 10 : tbl_cms_2      — conditional CMS row 2 increment
- *   Stage 11 : free
- * ============================================================================= */
+
 
 #include <core.p4>
 #if __TARGET_TOFINO__ == 3
@@ -37,8 +13,6 @@
 #include "../common/util.p4"
 
 // ---------------------------------------------------------------------------
-// Digest struct — 5-tuple sent to control plane for each new flow
-// ---------------------------------------------------------------------------
 struct flow_digest_t {
     bit<32> src_addr;
     bit<32> dst_addr;
@@ -48,39 +22,29 @@ struct flow_digest_t {
 }
 
 // ---------------------------------------------------------------------------
-// Metadata
-// ---------------------------------------------------------------------------
 struct metadata_t {
-    // Transport ports copied from TCP/UDP header.
     bit<16> src_port;
     bit<16> dst_port;
 
-    // BF hash indices — 17-bit each.
     bit<21> idx0;
     bit<21> idx1;
     bit<21> idx2;
 
-    // BF check-and-set results — needed across stages for conditional logic.
     bit<1> b0;
     bit<1> b1;
     bit<1> b2;
 
-    // Sub-sketch offset — already shifted: bucket_id << 10, in [15:10].
     bit<16> sketchlet_offset;
 
-    // Column hashes — bit<10> matches Hash<bit<10>> output.
     bit<10> col_hash_0;
     bit<10> col_hash_1;
     bit<10> col_hash_2;
 
-    // CMS indices — 16-bit each, computed per-table to stay within pathway limits.
     bit<16> cms_idx0;
     bit<16> cms_idx1;
     bit<16> cms_idx2;
 }
 
-// ---------------------------------------------------------------------------
-// Ingress Parser
 // ---------------------------------------------------------------------------
 parser SwitchIngressParser(
         packet_in pkt,
@@ -124,8 +88,6 @@ parser SwitchIngressParser(
 }
 
 // ---------------------------------------------------------------------------
-// Ingress Deparser
-// ---------------------------------------------------------------------------
 control SwitchIngressDeparser(
         packet_out pkt,
         inout header_t hdr,
@@ -165,8 +127,6 @@ control SwitchIngressDeparser(
 }
 
 // ---------------------------------------------------------------------------
-// Ingress Control
-// ---------------------------------------------------------------------------
 control SwitchIngress(
         inout header_t hdr,
         inout metadata_t ig_md,
@@ -174,10 +134,6 @@ control SwitchIngress(
         in    ingress_intrinsic_metadata_from_parser_t ig_prsr_md,
         inout ingress_intrinsic_metadata_for_deparser_t ig_dprsr_md,
         inout ingress_intrinsic_metadata_for_tm_t ig_tm_md) {
-
-    // =========================================================================
-    // BLOOM FILTER — Lazy Updates (Algorithm 2)        [identical to prototype5]
-    // =========================================================================
 
     Register<bit<1>, bit<21>>(2097152) bf_0;
     Register<bit<1>, bit<21>>(2097152) bf_1;
@@ -250,8 +206,6 @@ control SwitchIngress(
     }
 
     // =========================================================================
-    // LAZY BF TABLES                                    [identical to prototype5]
-    // =========================================================================
 
     action run_bf0() {
         ig_md.b0 = bf_check_set_0.execute(ig_md.idx0);
@@ -289,15 +243,10 @@ control SwitchIngress(
     }
 
     // =========================================================================
-    // MASTER HASH — selects which of 64 sub-sketches this flow belongs to
-    // Distinct polynomial from BF and CMS column hashes.
-    // =========================================================================
 
     CRCPolynomial<bit<32>>(32w0xF4ACFB13,
                            true, false, false,
                            32w0xFFFFFFFF, 32w0xFFFFFFFF) master_poly;
-    // Use Hash<bit<16>> and mask to bits [15:10] so the bucket_id lives in
-    // the upper 6 bits — no cast/multiply needed (avoids PHV/compiler issues).
     Hash<bit<16>>(HashAlgorithm_t.CUSTOM, master_poly) master_hash_fn;
 
     action compute_master_offset() {
@@ -312,11 +261,6 @@ control SwitchIngress(
         default_action = compute_master_offset;
         size           = 1;
     }
-
-    // =========================================================================
-    // COUNT-MIN SKETCH — sub-sketch partitioned (64 × 1024 cells per row)
-    // Final index = master_hash :: col_hash  (6 high bits :: 10 low bits)
-    // =========================================================================
 
     Register<bit<16>, bit<16>>(65536) cms_0;
     Register<bit<16>, bit<16>>(65536) cms_1;
@@ -358,7 +302,6 @@ control SwitchIngress(
     Hash<bit<10>>(HashAlgorithm_t.CUSTOM, cms_poly2) cms_hash2;
 
     // Stage 7: 3 column hashes — one per table to keep each table's
-    // immediate-pathway use under the 32-bit limit.
     action compute_col_hash_0() {
         ig_md.col_hash_0 = cms_hash0.get(
             {hdr.ipv4.src_addr, hdr.ipv4.dst_addr,
@@ -395,7 +338,6 @@ control SwitchIngress(
     }
 
     // Stage 8: combine sketchlet_offset with each col hash — split into
-    // 3 separate tables so each only does ONE 16-bit add (avoids 48-bit limit).
     action compute_cms_idx_0() {
         ig_md.cms_idx0 = ig_md.sketchlet_offset + (bit<16>)ig_md.col_hash_0;
     }
@@ -450,8 +392,6 @@ control SwitchIngress(
     }
 
     // =========================================================================
-    // IPv4 LPM forwarding table
-    // =========================================================================
 
     action hit(PortId_t dst_port) {
         ig_tm_md.ucast_egress_port = dst_port;
@@ -470,8 +410,6 @@ control SwitchIngress(
         default_action = miss();
     }
 
-    // =========================================================================
-    // Apply
     // =========================================================================
     apply {
         ig_md.src_port = 0;
@@ -519,9 +457,6 @@ control SwitchIngress(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Top-level pipeline
-// ---------------------------------------------------------------------------
 Pipeline(
     SwitchIngressParser(),
     SwitchIngress(),

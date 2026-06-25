@@ -1,29 +1,4 @@
 // main.cpp — shared traditional-BF control plane for the
-// cpp_traditional_bf*_cms64x1024 variants. The including Makefile
-// (cpp_traditional_common/Makefile.core) injects TRAD_BF_SIZE and
-// TRAD_P4_NAME at compile time so the same source builds against any
-// (BF size, P4 program name) pair.
-//
-// What it does:
-//   - Connects to bfrt-grpc on localhost:50052
-//   - Subscribes + binds to the P4 program named by TRAD_P4_NAME
-//   - Reads digests off the StreamChannel into a flow_table. Traditional BF
-//     fires at most ONE digest per visible flow (the packet that first sets
-//     any of the 3 BF bits) — so flow_table[k] is ~1 for every visible flow.
-//   - Every --epoch seconds:
-//       * Bulk-reads the 3 BF + 3 CMS register tables.
-//       * For each visible flow runs the sub-sketch equation solver
-//         (min(cms_rows) fallback when n > kColsPerRow).
-//         Per-flow estimate = digest_count + solver/cms estimate.
-//       * Prints a one-line summary (flows, digests, est. packets, max load).
-//       * Bulk-clears all 6 register tables.
-//
-// Algorithm 4 (BF preprocessing) is NOT applicable to a traditional BF:
-// every packet flips all 3 BF rows, so a 1-pkt mouse and an N-pkt elephant
-// leave identical BF state. Algorithm 5 (CMS preprocessing) DOES apply
-// under the §3.3 first-packet-via-digest optimisation: any flow with
-// min(cms_rows) == 0 has count = digest_count. Remaining flows go to the
-// sub-sketch equation solver (Exact / Alg6, bounded by min(cms_rows)).
 
 #include <atomic>
 #include <chrono>
@@ -40,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include <arpa/inet.h>     // inet_ntoa for CSV IP formatting
+#include <arpa/inet.h>
 
 #include "bfrt_client.hpp"
 #include "crc.hpp"
@@ -73,9 +48,9 @@ static constexpr const char* kP4Name    = TRAD_P4_NAME;
 static constexpr uint32_t    kDeviceId  = 0;
 static constexpr uint32_t    kClientId  = 0;
 
-static constexpr uint32_t    kBfSize      = TRAD_BF_SIZE;       // per-row BF cells
-static constexpr uint32_t    kCmsBuckets  = TRAD_CMS_BUCKETS;   // sub-sketch count
-static constexpr uint32_t    kColsPerRow  = TRAD_CMS_COLS;      // cols per sub-sketch
+static constexpr uint32_t    kBfSize      = TRAD_BF_SIZE;
+static constexpr uint32_t    kCmsBuckets  = TRAD_CMS_BUCKETS;
+static constexpr uint32_t    kColsPerRow  = TRAD_CMS_COLS;
 static constexpr uint32_t    kCmsSize     = kCmsBuckets * kColsPerRow;
 static constexpr uint32_t    kBucketShift = ilog2_pow2(kColsPerRow);
 static constexpr uint32_t    kCmsIndexMask = kCmsSize - 1;
@@ -99,15 +74,9 @@ static void on_sigint(int) { g_quit.store(true); }
 
 struct Config {
     double   epoch_seconds = 30.0;
-    uint32_t pipe_id       = 1;        // p4switch2 default
-    // Optional explicit overrides — comma-separated 3-ids each. If unset
-    // we resolve via the JSON parser in BfrtClient (which sometimes misses
-    // cms_2 because of an adjacent "id" field in the bfrt_info JSON).
+    uint32_t pipe_id       = 1;
     std::vector<uint32_t> bf_ids_override;
     std::vector<uint32_t> cms_ids_override;
-    // Test-harness flags. If csv_out is non-empty, after each epoch the
-    // per-flow estimates are appended to that file. If max_epochs > 0 the
-    // CP exits after that many epochs have ended.
     std::string csv_out;
     uint32_t    max_epochs = 0;
 };
@@ -145,26 +114,18 @@ static Config parse_args(int argc, char** argv) {
     return c;
 }
 
-
 // CMS index helpers (mirror Python control_plane.py exactly).
 static uint32_t master_bucket(const std::vector<uint8_t>& bytes) {
     uint32_t h32 = polys::master.compute(bytes.data(), bytes.size());
-    uint32_t h   = h32 & kCmsIndexMask;     // truncate to CMS index width
-    return h >> kBucketShift;               // upper log2(kCmsBuckets) bits
+    uint32_t h   = h32 & kCmsIndexMask;
+    return h >> kBucketShift;
 }
 // (Traditional BF doesn't need per-flow BF indices for classification —
-// every visible flow goes straight to the solver.)
 static uint32_t cms_col(const Crc32& fn, const std::vector<uint8_t>& bytes) {
     return fn.compute(bytes.data(), bytes.size()) & (kColsPerRow - 1);
 }
 
 int main(int argc, char** argv) {
-    // Self-test mode: compute CRC of "123456789" for every config and print
-    // hex output. Standard CRC test vectors say (from RevEng catalog):
-    //   CRC-32       (poly 0x04C11DB7, refl, init=FFFF.., xor=FFFF..) -> 0xCBF43926
-    //   CRC-32/BZIP2 (poly 0x04C11DB7, !refl, init=FFFF.., xor=FFFF..) -> 0xFC891918
-    //   CRC-32C      (poly 0x1EDC6F41, refl, init=FFFF.., xor=FFFF..) -> 0xE3069283
-    //   CRC-32D      (poly 0xA833982B, refl, init=FFFF.., xor=FFFF..) -> 0x87315576
     if (argc >= 2 && std::string(argv[1]) == "--selftest") {
         const char* s = "123456789";
         std::vector<uint8_t> b(s, s + 9);
@@ -242,8 +203,6 @@ int main(int argc, char** argv) {
     while (!g_quit.load()) {
         std::this_thread::sleep_for(epoch_dur);
 
-        // Snapshot (and detach) the current flow_table so digest collection
-        // continues into the next epoch's table while we process this one.
         FlowTable snap;
         {
             std::lock_guard<std::mutex> lk(flow_mu);
@@ -273,7 +232,6 @@ int main(int argc, char** argv) {
         double read_secs = std::chrono::duration<double>(t1 - t0).count();
         std::cerr << "  bulk read time         : " << read_secs << " s\n";
 
-        // Diagnostic: how many cells are non-zero per row, and what's the sum?
         for (size_t i = 0; i < 3; ++i) {
             uint64_t sum = 0, nz = 0;
             for (auto v : bf[i])  { if (v) { sum += v; ++nz; } }
@@ -287,17 +245,6 @@ int main(int argc, char** argv) {
                       << " non-zero cells, sum=" << sum << "\n";
         }
 
-        // (Per-flow CRC/index diagnostic removed — was useful for the 6-flow
-        // probe but spams the terminal at line-rate scale. Re-enable it
-        // behind a flag if you ever need to debug index computation again.)
-
-        // Traditional BF: Algorithm 4 (BF preprocessing) does not apply —
-        // every packet flips all 3 BF rows, so BF state cannot distinguish
-        // a 1-pkt mouse from an N-pkt elephant. Algorithm 5 (CMS
-        // preprocessing) DOES apply: under the §3.3 optimisation the first
-        // packet of every flow is counted via the digest and does not
-        // increment the CMS, so any flow with min(cms_rows) == 0 has its
-        // exact count in digest_count.
         std::array<std::vector<FlowKey>, kCmsBuckets>                    buckets;
         std::array<std::vector<std::array<std::pair<int,uint32_t>,3>>, kCmsBuckets> bucket_cells;
         std::array<std::vector<uint64_t>, 3> cms_arr{cms[0], cms[1], cms[2]};
@@ -305,8 +252,6 @@ int main(int argc, char** argv) {
         uint64_t epoch_digests = 0, epoch_packets = 0;
         size_t   alg5_count = 0, solver_input_count = 0;
 
-        // Per-flow estimate + path tag (path is one of "alg5", "exact",
-        // "alg6", "min"; Alg4 never fires on traditional BF).
         std::unordered_map<FlowKey, std::pair<uint64_t, const char*>, FlowKeyHash> per_flow;
         per_flow.reserve(snap.size());
 
@@ -326,8 +271,6 @@ int main(int argc, char** argv) {
                 {2, off | cms_col(polys::cms2, bytes)},
             }};
 
-            // Algorithm 5: if the flow contributed nothing to the CMS,
-            // its true count is the digest count.
             uint64_t cmin = std::min({cms[0][cells[0].second],
                                        cms[1][cells[1].second],
                                        cms[2][cells[2].second]});
@@ -343,16 +286,11 @@ int main(int argc, char** argv) {
             ++solver_input_count;
         }
 
-        // Sub-sketch equation solver on the remaining flows.
         size_t   exact_buckets = 0, alg6_buckets = 0, skipped_buckets = 0;
         size_t   total_used_buckets = 0;
         uint64_t max_bucket_flows = 0;
         std::unordered_map<const FlowKey*, uint64_t> per_flow_cms;
 
-        // Stage 1: solve buckets in parallel (paper §3.4.3). See lazy
-        // variant for full notes. No skip criterion — every non-empty
-        // bucket runs through solve_bucket; LSQR's per-bucket cost is
-        // bounded regardless of n.
         std::vector<SolverResult> bucket_results(kCmsBuckets);
         auto t_solve0 = std::chrono::steady_clock::now();
         #pragma omp parallel for schedule(dynamic, 1)
@@ -364,7 +302,6 @@ int main(int argc, char** argv) {
         std::cerr << "  solver time (local)  : "
                   << std::chrono::duration<double>(t_solve1 - t_solve0).count() << " s\n";
 
-        // Stage 2: serial merge.
         for (size_t b = 0; b < kCmsBuckets; ++b) {
             if (buckets[b].empty()) continue;
             ++total_used_buckets;
@@ -391,22 +328,13 @@ int main(int argc, char** argv) {
                 if (r.path == SolverPath::Skipped) {
                     v = cms_min;
                 } else {
-                    // Paper Section 3.4.2: bound the solver output by the
-                    // standard CMS min to cap worst-case error from
-                    // hidden-flow contamination.
                     v = std::min(r.cms_estimate[j], cms_min);
                 }
                 auto it = snap.find(buckets[b][j]);
                 if (it != snap.end()) per_flow_cms[&(it->first)] = v;
 #ifdef TRAD_CMS_UNGATED
-                // Paper Algorithm 1: every packet (including the first) is
-                // counted in the CMS, so the solver value v already holds the
-                // full count. Adding the digest count would double-count the
-                // first packet (+1 per flow), so the estimate is just v.
                 uint64_t est = v;
 #else
-                // Gated CMS (first-packet-via-digest optimisation): the CMS
-                // holds only the 2nd-and-later packets, so add the digest count.
                 uint64_t est = it->second + v;
 #endif
                 epoch_packets += est;
@@ -441,20 +369,19 @@ int main(int argc, char** argv) {
             nz.reserve(bf[i].size() / 16);
             for (uint32_t k = 0; k < bf[i].size(); ++k)
                 if (bf[i][k]) nz.push_back(k);
-            client.clear_register_indices(bf_ids[i], nz, /*value_bytes=*/1);
+            client.clear_register_indices(bf_ids[i], nz, 1);
         }
         for (size_t i = 0; i < 3; ++i) {
             std::vector<uint32_t> nz;
             nz.reserve(cms[i].size() / 16);
             for (uint32_t k = 0; k < cms[i].size(); ++k)
                 if (cms[i][k]) nz.push_back(k);
-            client.clear_register_indices(cms_ids[i], nz, /*value_bytes=*/2);
+            client.clear_register_indices(cms_ids[i], nz, 2);
         }
         auto t3 = std::chrono::steady_clock::now();
         std::cerr << "  bulk clear time        : "
                   << std::chrono::duration<double>(t3 - t2).count() << " s\n";
 
-        // Optional per-flow CSV dump (for the eval harness).
         if (!cfg.csv_out.empty()) {
             std::ofstream out(cfg.csv_out);
             if (!out) {
