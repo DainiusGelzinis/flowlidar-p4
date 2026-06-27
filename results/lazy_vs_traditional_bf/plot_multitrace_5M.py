@@ -96,7 +96,7 @@ def make_plot(mlazy, slazy, mtrad, strad, ylabel, fname, ylim=None):
     ax.legend()
     fig.tight_layout(pad=0.2)
     out_path = os.path.join(OUT, fname)
-    fig.savefig(out_path, dpi=160)
+    fig.savefig(out_path, dpi=160, facecolor="none")
     plt.close(fig)
     print(f"[wrote] {out_path}")
 

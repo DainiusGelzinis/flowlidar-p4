@@ -151,18 +151,6 @@ int main(int argc, char** argv) {
     Config cfg = parse_args(argc, argv);
     std::signal(SIGINT, on_sigint);
 
-    std::cerr << "============================================================\n"
-              << "  cpp_lazy_common — pure C++ control plane (P4: "
-              << kP4Name << ")\n"
-              << "  bfrt-gRPC        : " << kAddr << "\n"
-              << "  P4 program       : " << kP4Name << "\n"
-              << "  Device / Pipe    : " << kDeviceId << " / " << cfg.pipe_id << "\n"
-              << "  Epoch length     : " << cfg.epoch_seconds << " s\n"
-              << "  BF cells per row : " << kBfSize << "\n"
-              << "  CMS cells per row: " << kCmsSize
-              << " (" << kCmsBuckets << " buckets * " << kColsPerRow << " cols)\n"
-              << "============================================================\n";
-
     BfrtClient client(kAddr, kP4Name, kDeviceId, kClientId, cfg.pipe_id);
     if (!client.connect_and_bind()) return 1;
 
@@ -179,11 +167,6 @@ int main(int argc, char** argv) {
             std::cerr << "[main] cannot resolve " << kCmsNames[i] << "\n"; return 1;
         }
     }
-    std::cerr << "[main] BF  table ids : "
-              << bf_ids[0] << " " << bf_ids[1] << " " << bf_ids[2] << "\n";
-    std::cerr << "[main] CMS table ids : "
-              << cms_ids[0] << " " << cms_ids[1] << " " << cms_ids[2] << "\n";
-
     FlowTable             flow_table;
     std::mutex            flow_mu;
     std::atomic<uint64_t> total_digests{0};
@@ -198,7 +181,7 @@ int main(int argc, char** argv) {
         }
     });
 
-    std::cerr << "[main] connected. waiting for packets...\n";
+    std::cerr << "Waiting for packets...\n";
     auto epoch_dur = std::chrono::milliseconds((int64_t)(cfg.epoch_seconds * 1000.0));
     uint32_t epoch_num = 1;
 
@@ -211,18 +194,12 @@ int main(int argc, char** argv) {
             snap.swap(flow_table);
         }
 
-        std::cerr << "\n========================================================================\n"
-                  << "  EPOCH " << epoch_num << " END  -  "
-                  << snap.size() << " flows detected by BF\n"
-                  << "========================================================================\n";
+        std::cerr << "=== EPOCH " << epoch_num << " END ===\n";
 
         if (snap.empty()) {
-            std::cerr << "  (no flows this epoch — skipping snapshot/clear)\n";
             ++epoch_num;
             continue;
         }
-
-        auto t0 = std::chrono::steady_clock::now();
 
         std::vector<std::vector<uint64_t>> bf(3), cms(3);
         for (size_t i = 0; i < 3; ++i) {
@@ -230,29 +207,11 @@ int main(int argc, char** argv) {
             if (!client.read_register(cms_ids[i], kCmsSize, cms[i])) return 1;
         }
 
-        auto t1 = std::chrono::steady_clock::now();
-        double read_secs = std::chrono::duration<double>(t1 - t0).count();
-        std::cerr << "  bulk read time         : " << read_secs << " s\n";
-
-        for (size_t i = 0; i < 3; ++i) {
-            uint64_t sum = 0, nz = 0;
-            for (auto v : bf[i])  { if (v) { sum += v; ++nz; } }
-            std::cerr << "    bf_"  << i << " : " << nz
-                      << " non-zero cells, sum=" << sum << "\n";
-        }
-        for (size_t i = 0; i < 3; ++i) {
-            uint64_t sum = 0, nz = 0;
-            for (auto v : cms[i]) { if (v) { sum += v; ++nz; } }
-            std::cerr << "    cms_" << i << " : " << nz
-                      << " non-zero cells, sum=" << sum << "\n";
-        }
-
         std::array<std::vector<FlowKey>, kCmsBuckets>                    buckets;
         std::array<std::vector<std::array<std::pair<int,uint32_t>,3>>, kCmsBuckets> bucket_cells;
         std::array<std::vector<uint64_t>, 3> cms_arr{cms[0], cms[1], cms[2]};
 
-        uint64_t epoch_digests = 0, epoch_packets = 0;
-        size_t   alg4_count = 0, alg5_count = 0, solver_input_count = 0;
+        uint64_t epoch_packets = 0;
 
         std::unordered_map<FlowKey, std::pair<uint64_t, const char*>, FlowKeyHash> per_flow;
         per_flow.reserve(snap.size());
@@ -260,7 +219,6 @@ int main(int argc, char** argv) {
         for (const auto& kv : snap) {
             const FlowKey& k = kv.first;
             uint32_t       dc = kv.second;
-            epoch_digests += dc;
 
             auto bytes = pack_5tuple(k.src_ip, k.dst_ip, k.proto,
                                       k.src_port, k.dst_port);
@@ -269,7 +227,6 @@ int main(int argc, char** argv) {
             uint32_t bf_i2 = bf_idx(polys::bf2, bytes);
 
             if (bf[0][bf_i0] == 0 || bf[1][bf_i1] == 0 || bf[2][bf_i2] == 0) {
-                ++alg4_count;
                 epoch_packets += dc;
                 per_flow[k] = {dc, "alg4"};
                 continue;
@@ -287,7 +244,6 @@ int main(int argc, char** argv) {
                                        cms[1][cells[1].second],
                                        cms[2][cells[2].second]});
             if (cmin == 0) {
-                ++alg5_count;
                 epoch_packets += dc;
                 per_flow[k] = {dc, "alg5"};
                 continue;
@@ -295,38 +251,18 @@ int main(int argc, char** argv) {
 
             buckets[bucket].push_back(k);
             bucket_cells[bucket].push_back(cells);
-            ++solver_input_count;
         }
 
-        size_t   exact_buckets = 0, alg6_buckets = 0, skipped_buckets = 0;
-        size_t   total_used_buckets = 0;
-        uint64_t max_bucket_flows = 0;
-        std::unordered_map<const FlowKey*, uint64_t> per_flow_cms;
-
         std::vector<SolverResult> bucket_results(kCmsBuckets);
-        auto t_solve0 = std::chrono::steady_clock::now();
         #pragma omp parallel for schedule(dynamic, 1)
         for (size_t b = 0; b < kCmsBuckets; ++b) {
             if (buckets[b].empty()) continue;
             bucket_results[b] = solve_bucket(buckets[b], bucket_cells[b], cms_arr);
         }
-        auto t_solve1 = std::chrono::steady_clock::now();
-        std::cerr << "  solver time (local)  : "
-                  << std::chrono::duration<double>(t_solve1 - t_solve0).count() << " s\n";
 
         for (size_t b = 0; b < kCmsBuckets; ++b) {
             if (buckets[b].empty()) continue;
-            ++total_used_buckets;
-            if (buckets[b].size() > max_bucket_flows) max_bucket_flows = buckets[b].size();
-
             const SolverResult& r = bucket_results[b];
-            if (r.path == SolverPath::Skipped) {
-                ++skipped_buckets;
-            } else if (r.path == SolverPath::Exact) {
-                ++exact_buckets;
-            } else if (r.path == SolverPath::Algorithm6) {
-                ++alg6_buckets;
-            }
             const char* path_tag = (r.path == SolverPath::Skipped)    ? "min"
                                  : (r.path == SolverPath::Exact)      ? "exact"
                                  : (r.path == SolverPath::Algorithm6) ? "alg6"
@@ -343,36 +279,14 @@ int main(int argc, char** argv) {
                     v = std::min(r.cms_estimate[j], cms_min);
                 }
                 auto it = snap.find(buckets[b][j]);
-                if (it != snap.end()) per_flow_cms[&(it->first)] = v;
                 epoch_packets += it->second + v;
                 per_flow[buckets[b][j]] = {it->second + v, path_tag};
             }
         }
-        double max_load = (double)max_bucket_flows / kColsPerRow;
 
-        size_t total_flows = snap.size();
-        auto pct = [&](size_t v) -> double {
-            return total_flows ? 100.0 * v / total_flows : 0.0;
-        };
-        std::cerr << "  Total flows            : " << total_flows << "\n"
-                  << "  Epoch digests          : " << epoch_digests << "\n"
-                  << "  Estimated packets      : " << epoch_packets << "\n"
-                  << "  Resolved by Alg4 (BF negative)  : " << alg4_count
-                  << "  (" << pct(alg4_count) << "%)\n"
-                  << "  Resolved by Alg5 (CMS == 0)     : " << alg5_count
-                  << "  (" << pct(alg5_count) << "%)\n"
-                  << "  Equation solver / min fallback  : " << solver_input_count
-                  << "  (" << pct(solver_input_count) << "%)\n"
-                  << "  Sub-sketch buckets used: " << total_used_buckets
-                  << " / " << kCmsBuckets << "  (exact: " << exact_buckets
-                  << ", Alg6 approx: " << alg6_buckets
-                  << ", skipped: " << skipped_buckets << ")\n"
-                  << "  Max sub-sketch load    : " << max_load
-                  << "  (max bucket = " << max_bucket_flows << " flows / "
-                  << kColsPerRow << " cols)\n";
+        std::cerr << "  Estimated flows: " << snap.size()
+                  << "   estimated packets: " << epoch_packets << "\n";
 
-        std::cerr << "  Clearing BF + CMS registers (targeted, non-zero only)...\n";
-        auto t2 = std::chrono::steady_clock::now();
         for (size_t i = 0; i < 3; ++i) {
             std::vector<uint32_t> nz;
             nz.reserve(bf[i].size() / 16);
@@ -387,9 +301,6 @@ int main(int argc, char** argv) {
                 if (cms[i][k]) nz.push_back(k);
             client.clear_register_indices(cms_ids[i], nz, /*value_bytes=*/2);
         }
-        auto t3 = std::chrono::steady_clock::now();
-        std::cerr << "  bulk clear time        : "
-                  << std::chrono::duration<double>(t3 - t2).count() << " s\n";
 
         if (!cfg.csv_out.empty()) {
             std::ofstream out(cfg.csv_out);
@@ -415,22 +326,18 @@ int main(int argc, char** argv) {
                         << k.src_port << "," << k.dst_port << ","
                         << dc << "," << est << "," << path << "\n";
                 }
-                std::cerr << "  CSV out written        : " << cfg.csv_out
-                          << " (" << per_flow.size() << " flows)\n";
+                std::cerr << "  CSV saved: " << cfg.csv_out << "\n";
             }
         }
 
-        std::cerr << "========================================================================\n";
         ++epoch_num;
 
         if (cfg.max_epochs && (epoch_num - 1) >= cfg.max_epochs) {
-            std::cerr << "[main] --epochs " << cfg.max_epochs
-                      << " reached; exiting\n";
             break;
         }
     }
 
-    std::cerr << "[main] shutting down\n";
     client.stop_digest_stream();
+    std::cerr << "Finished successfully\n";
     return 0;
 }

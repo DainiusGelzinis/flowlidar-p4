@@ -165,7 +165,7 @@ def combined_grouped_bar(fname):
     fig.tight_layout()
 
     out_path = os.path.join(OUT, fname)
-    fig.savefig(out_path, dpi=160)
+    fig.savefig(out_path, dpi=160, facecolor="none")
     plt.close(fig)
     print(f"[wrote] {out_path}")
 

@@ -54,7 +54,6 @@ bool BfrtClient::connect_and_bind() {
         std::cerr << "[bfrt] subscribe rejected: " << rsp.subscribe().status().message() << "\n";
         return false;
     }
-    std::cerr << "[bfrt] subscribed (client_id=" << client_id_ << ")\n";
 
     grpc::ClientContext bind_ctx;
     bind_ctx.AddMetadata("client_id", std::to_string(client_id_));
@@ -70,7 +69,6 @@ bool BfrtClient::connect_and_bind() {
         std::cerr << "[bfrt] BIND failed: " << status.error_message() << "\n";
         return false;
     }
-    std::cerr << "[bfrt] bound to " << p4_name_ << "\n";
 
     return load_bfrt_info();
 }
@@ -109,7 +107,6 @@ bool BfrtClient::parse_table_ids(const std::string& info) {
         table_id_[name] = id;
         pos = i;
     }
-    std::cerr << "[bfrt] parsed " << table_id_.size() << " name->id pairs\n";
     return !table_id_.empty();
 }
 

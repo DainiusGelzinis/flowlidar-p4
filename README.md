@@ -30,8 +30,7 @@ flowlidar/
 │       split_pcaps.sh  truth_csv.sh  compare.py  aggregate.py
 ├── evaluation/traffic_load_test/   # load-sweep cut scripts (phase1/phase2)
 ├── traffic_gen/                    # Click/DPDK replay configs (run on the server)
-├── results/                        # experiment outputs + plot scripts
-└── docs/                           # paper, survey, notes
+└── results/                        # experiment outputs + plot scripts
 ```
 
 **Variants used in the experiments (6 lazy + 6 standard):**
@@ -66,7 +65,7 @@ export SDE_INSTALL=$SDE/install
 A new person copies the repo to the switch's `~/flowlidar/`. From this machine:
 ```bash
 scp -r cpp_lazy_common cpp_traditional_common common \
-       cpp_lazy_bf2m_cms256x1024 cpp_traditional_bf2m_cms256x1024 \
+       cpp_lazy_bf131k_cms256x1024 cpp_traditional_bf131k_cms256x1024 \
        <switch>:~/flowlidar/
 ```
 Sync whichever variant dirs you need (each is self-contained but needs
@@ -112,7 +111,7 @@ Per variant (`<V>` = variant name) — `build.sh` runs cmake + the P4 compiler +
 install, then `make` builds the control plane:
 ```bash
 ssh <switch>
-cd ~/flowlidar/cpp_<V>     # e.g. cpp_traditional_bf2m_cms256x1024
+cd ~/flowlidar/cpp_<V>     # e.g. cpp_lazy_bf131k_cms256x1024
 ./build.sh        # compiles + installs the P4 program (tofino.bin, context.json)
 make              # builds the control-plane binary  <V>_cp
 ```
@@ -122,7 +121,7 @@ make              # builds the control-plane binary  <V>_cp
 
 ## 6. Run FlowLiDAR (per variant)
 
-Use `<V>` = variant name, e.g. `traditional_bf2m_cms256x1024`.
+Use `<V>` = variant name, e.g. `lazy_bf131k_cms256x1024`.
 
 **Terminal 1 (switch) — start the data plane**
 ```bash
@@ -147,11 +146,21 @@ cd ~/flowlidar/cpp_<V>
 ./<V>_cp --pipe 1 --epoch 30 --epochs 1 \
          --bf-ids a,b,c --cms-ids d,e,f \
          --csv-out estimates.csv
-#   wait for "waiting for packets..."
+#   wait for "Waiting for packets..." before starting the replay
 ```
 - `--epoch` is **seconds**; make it ≥ replay time + register read (use 60 for big chunks).
 - `--epochs 1` runs one epoch and exits (omit to loop until Ctrl-C).
 - Always pass `--bf-ids`/`--cms-ids` (don't rely on auto-resolve).
+
+The control plane prints only:
+```
+Waiting for packets...
+  [50000 digests received, N unique flows]     (every 50k digests)
+=== EPOCH 1 END ===
+  Estimated flows: ...   estimated packets: ...
+  CSV saved: estimates.csv
+Finished successfully
+```
 
 > **Register IDs are stable across all variants** (same P4 register names →
 > same bf-p4c IDs):
@@ -166,7 +175,7 @@ cd ~/flowlidar/cpp_<V>
 Start the replay **inside** the control plane's epoch window:
 ```bash
 ssh <user>@<server>
-PCAP=~/chunks/130000_loads/load_4000000_legacy.pcap
+PCAP=~/chunks/130000_loads/load_1000000_legacy.pcap
 /opt/p4eval/bin/click --dpdk -a 0000:ac:00.0 -l 0-3 -- \
    ~/simple_pcap_replay.click trace=$PCAP RATE=2Gbps replay_count=1
 ```
@@ -189,7 +198,7 @@ src_ip,dst_ip,proto,src_port,dst_port,digest_count,estimated_packets,solver_path
 Join estimate vs truth, compute metrics, append a row to a summary CSV:
 ```bash
 python3 evaluation/harness/compare.py truth.csv estimates.csv summary.csv \
-        --meta variant=traditional_bf2m_cms256x1024 load=4000000 trace=130000
+        --meta variant=lazy_bf131k_cms256x1024 load=1000000 trace=130000
 ```
 `compare.py` reports hidden share, coverage, packet accuracy, AAE, ARE,
 `pct_exact`, the solver-path mix, and per-size-class errors.

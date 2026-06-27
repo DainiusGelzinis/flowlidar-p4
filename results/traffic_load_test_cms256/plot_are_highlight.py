@@ -47,12 +47,13 @@ ax.legend(loc="upper left")
 # annotate the highlighted points
 def ann(idx, vals, dy):
     for v, color in [(std[idx], "#d62728"), (lazy[idx], "#1f77b4")]:
+        off = -16 if color == "#d62728" else dy
         ax.annotate(f"{v:.0f}%" if v >= 10 else f"{v:.1f}%",
-                    (x[idx], v), textcoords="offset points", xytext=(8, dy),
-                    color=color, fontsize=12, fontweight="bold")
+                    (x[idx], v), textcoords="offset points", xytext=(-8, off),
+                    color=color, fontsize=12, fontweight="bold", ha="right")
 ann(4, None, 6)   # annotate values at 16M only
 
 fig.tight_layout(pad=0.3)
 OUT = "/home/student/Desktop/BEP_Presentation/TUe_presentation_template/figs/load_are.pdf"
-fig.savefig(OUT)
+fig.savefig(OUT, facecolor="none")
 print("[wrote]", OUT)
